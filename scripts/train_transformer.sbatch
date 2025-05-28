@@ -16,8 +16,6 @@
 module load python/3.10
 . ~/Master-Thesis/env_subseg/bin/activate
 
-mkdir -p ~/Master-Thesis/logs
-
 cd ~/Master-Thesis
 
 srun python ~/Master-Thesis/electrical_substation_segmentation.py \
