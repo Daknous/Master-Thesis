@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH --job-name=subseg_train
-#SBATCH --output=~/Master-Thesis/logs/train_%j.out
-#SBATCH --error=~/Master-Thesis/logs/train_%j.err
+#SBATCH --output=/home/users/s/seifdak/Master-Thesis/logs/train_%j.out
+#SBATCH --error=/home/users/s/seifdak/Master-Thesis/logs/train_%j.err
 #SBATCH --partition=gpu
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
