@@ -15,7 +15,7 @@ albumentations==2.0.7
 opencv-python-headless==4.11.0.86
 
 # Numerical and logging utilities
-numpy>=1.21.0
+numpy==1.24.4
 PyYAML>=6.0
 
 tqdm>=4.64.0
