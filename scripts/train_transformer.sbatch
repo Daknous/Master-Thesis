@@ -15,6 +15,7 @@
 
 module load python/3.9.19
 . ~/Master-Thesis/env_subseg/bin/activate
+pip install --upgrade --no-cache-dir -r ~/Master-Thesis/requirements.txt
 
 cd ~/Master-Thesis
 
