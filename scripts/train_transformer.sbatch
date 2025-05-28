@@ -13,7 +13,7 @@
 #SBATCH --mail-type=END,FAIL
 #SBATCH --mail-user=seif.daknou@campus.tu-berlin.de
 
-module load python/3.10
+module load python/3.9.19
 . ~/Master-Thesis/env_subseg/bin/activate
 
 cd ~/Master-Thesis
