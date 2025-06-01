@@ -178,3 +178,4 @@ Dataset/
 runs/
 logs/
 validation_overlays/
+.DS_Store
