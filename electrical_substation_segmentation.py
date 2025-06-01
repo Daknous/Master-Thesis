@@ -3,14 +3,16 @@ Single‐script training pipeline for transformer segmentation using PyTorch and
 Uses a combined BCE + Dice loss and runs a validation loop each epoch to track IoU.
 Usage:
     python electrical_substation_segmentation.py \
-        --images_dir /path/to/train/images \
-        --coco_json /path/to/annotations.json \
+        --train_images_dir /path/to/train/images \
+        --train_coco_json  /path/to/train/_annotations.coco.json \
+        --val_images_dir   /path/to/valid/images \
+        --val_coco_json    /path/to/valid/_annotations.coco.json \
         --batch_size 8 \
         --lr 1e-4 \
         --epochs 50 \
         --num_workers 4 \
-        --val_split valid \
-        [--device cuda] [--dry_run]
+        [--device cuda] [--dry_run] \
+        [--log_dir runs/exp2]
 """
 
 import os
@@ -32,6 +34,7 @@ from glob import glob
 IMG_SIZE = 512
 ENCODER = 'resnet50'
 PREPROCESS_FN = smp.encoders.get_preprocessing_fn(ENCODER, 'imagenet')
+
 
 # ---------------------------
 # Augmentation Pipelines
@@ -61,22 +64,37 @@ def get_validation_augmentation():
 # Dataset Definition
 # ---------------------------
 class SubstationDataset(Dataset):
+    """
+    PyTorch Dataset for substation transformer segmentation.
+    Expects:
+      - images_dir: folder containing RGB images (*.png, *.jpg)
+      - coco_json: path to COCO-format JSON listing only images/annotations for this split
+    Returns (image_tensor, mask_tensor, filename).
+    """
+
     def __init__(self, images_dir, coco_json, augmentation=None, preprocessing_fn=None):
+        # List all PNG/JPG files in images_dir
         self.image_paths = sorted(
             glob(os.path.join(images_dir, '*.png')) + glob(os.path.join(images_dir, '*.jpg'))
         )
-        # Load COCO JSON
+
+        # Load COCO JSON for this split
         with open(coco_json, 'r') as f:
             coco = json.load(f)
-        # Find transformer category
-        transformer = next(c for c in coco['categories'] if c['name'].lower()=='transformer')
+
+        # Identify the “transformer” category
+        transformer = next(c for c in coco['categories'] if c['name'].lower() == 'transformer')
         self.tid = transformer['id']
-        # Group annotations by image id
+
+        # Group annotations by image_id
         self.anns_by_image = {}
         for ann in coco['annotations']:
             if ann['category_id'] == self.tid:
                 self.anns_by_image.setdefault(ann['image_id'], []).append(ann)
+
+        # Build a map: filename → image_id
         self.name2id = {img['file_name']: img['id'] for img in coco['images']}
+
         self.augmentation = augmentation
         self.preprocessing_fn = preprocessing_fn
 
@@ -84,129 +102,147 @@ class SubstationDataset(Dataset):
         return len(self.image_paths)
 
     def __getitem__(self, idx):
-        # Load image
+        # 1. Load RGB image
         img_path = self.image_paths[idx]
         filename = os.path.basename(img_path)
-        image_id = self.name2id[filename]
+        image_id = self.name2id[filename]  # Look up its ID in this split’s JSON
+
         image = cv2.cvtColor(cv2.imread(img_path), cv2.COLOR_BGR2RGB)
         h, w = image.shape[:2]
-        # Build binary mask
+
+        # 2. Build a binary mask of size (H,W)
         mask = np.zeros((h, w), dtype=np.uint8)
         for ann in self.anns_by_image.get(image_id, []):
             if 'segmentation' in ann and isinstance(ann['segmentation'], list):
+                # Polygon‐based segmentation
                 for seg in ann['segmentation']:
-                    pts = np.array(seg).reshape(-1,2).astype(np.int32)
+                    pts = np.array(seg).reshape(-1, 2).astype(np.int32)
                     cv2.fillPoly(mask, [pts], 1)
             else:
+                # Fallback to bounding box [x,y,width,height]
                 x, y, bw, bh = map(int, ann['bbox'])
                 cv2.rectangle(mask, (x, y), (x + bw, y + bh), 1, -1)
-        # One-hot encode: [background, transformer]
+
+        # 3. One‐hot encode: [background, transformer]
         mask = mask.astype('float32')
         bg = 1.0 - mask
         mask = np.stack([bg, mask], axis=-1)
-        # Augment & preprocess
+
+        # 4. Apply augmentations (simultaneously to image & mask)
         if self.augmentation:
             data = self.augmentation(image=image, mask=mask)
             image, mask = data['image'], data['mask']
+
+        # 5. Preprocess image (e.g. ResNet mean/std)
         if self.preprocessing_fn:
             image = self.preprocessing_fn(image)
-        # Convert to CHW
-        image = image.astype('float32').transpose(2, 0, 1)
-        mask  = mask.astype('float32').transpose(2, 0, 1)
+
+        # 6. Convert to PyTorch format: CHW
+        image = image.astype('float32').transpose(2, 0, 1)  # [3,H,W]
+        mask = mask.astype('float32').transpose(2, 0, 1)    # [2,H,W]
+
         return torch.from_numpy(image), torch.from_numpy(mask), filename
 
 
 # ---------------------------
-# Training & Validation Routines
+# Training & Validation Routine
 # ---------------------------
 def train_model(args):
-    # 1) Set up device
+    # 1) Device setup
     if args.device == 'auto':
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     else:
         device = torch.device(args.device)
     print(f"Using device: {device}")
 
-    # 2) DataLoaders
-    train_dir = args.images_dir
-    val_dir   = train_dir.replace('train', args.val_split)
-
+    # 2) Build Datasets & DataLoaders
     train_ds = SubstationDataset(
-        images_dir=train_dir,
-        coco_json=args.coco_json,
-        augmentation=get_training_augmentation(),
-        preprocessing_fn=PREPROCESS_FN
+        images_dir       = args.train_images_dir,
+        coco_json        = args.train_coco_json,
+        augmentation     = get_training_augmentation(),
+        preprocessing_fn = PREPROCESS_FN
     )
     val_ds = SubstationDataset(
-        images_dir=val_dir,
-        coco_json=args.coco_json,
-        augmentation=get_validation_augmentation(),
-        preprocessing_fn=PREPROCESS_FN
+        images_dir       = args.val_images_dir,
+        coco_json        = args.val_coco_json,
+        augmentation     = get_validation_augmentation(),
+        preprocessing_fn = PREPROCESS_FN
     )
 
     train_loader = DataLoader(
-        train_ds, batch_size=args.batch_size, shuffle=True,
-        num_workers=args.num_workers, pin_memory=True
+        train_ds,
+        batch_size   = args.batch_size,
+        shuffle      = True,
+        num_workers  = args.num_workers,
+        pin_memory   = True
     )
-    val_loader   = DataLoader(
-        val_ds,   batch_size=1, shuffle=False,
-        num_workers=args.num_workers, pin_memory=True
+    val_loader = DataLoader(
+        val_ds,
+        batch_size   = 1,
+        shuffle      = False,
+        num_workers  = args.num_workers,
+        pin_memory   = True
     )
 
     # 3) Model, loss, optimizer
     model = smp.Unet(
-        encoder_name=ENCODER,
-        encoder_weights='imagenet',
-        in_channels=3,
-        classes=2
+        encoder_name    = ENCODER,
+        encoder_weights = 'imagenet',
+        in_channels     = 3,
+        classes         = 2
     )
     model.to(device)
 
     # Composite loss: BCEWithLogits + Dice
     bce_loss  = nn.BCEWithLogitsLoss()
     dice_loss = smp.losses.DiceLoss(mode='binary')
-    # Optionally you could also add a focal term:
-    # focal_loss = smp.losses.BinaryFocalLoss(alpha=0.75, gamma=2)
-    # total_loss = bce_loss + dice_loss + focal_loss
-
     optimizer = optim.Adam(model.parameters(), lr=args.lr)
 
     best_val_iou = 0.0
 
-    # Dry run? Test a single batch and exit
+    # 4) Dry‐run (optional)
     if args.dry_run:
         imgs, masks, _ = next(iter(train_loader))
         imgs, masks = imgs.to(device), masks.to(device)
-        preds = model(imgs)
-        print(f"Dry run shapes -> imgs: {imgs.shape}, masks: {masks.shape}, preds: {preds.shape}")
+        with torch.no_grad():
+            preds = model(imgs)
+        print(f"Dry run shapes → imgs: {imgs.shape}, masks: {masks.shape}, preds: {preds.shape}")
         sys.exit(0)
 
-    # 4) Main training loop
+    # 5) Main training loop
     for epoch in range(1, args.epochs + 1):
         model.train()
-        total_loss, count = 0.0, 0
+        total_loss = 0.0
+        count = 0
+
         for imgs, masks, _ in train_loader:
             imgs, masks = imgs.to(device), masks.to(device)
-            preds = model(imgs)                        # [B,2,512,512]
-            loss  = bce_loss(preds, masks) + dice_loss(preds, masks)
+
+            preds = model(imgs)  # [B,2,512,512]
+            loss = bce_loss(preds, masks) + dice_loss(preds, masks)
+
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
+
             total_loss += loss.item()
             count += 1
 
         avg_train_loss = total_loss / count
-        print(f"Epoch {epoch}/{args.epochs} - Train Loss: {avg_train_loss:.4f}")
+        print(f"Epoch {epoch}/{args.epochs} → Train Loss: {avg_train_loss:.4f}")
 
-        # 5) Validation loop (compute IoU on “transformer” channel)
+        # 6) Validation loop (compute IoU at threshold=0.5)
         model.eval()
-        val_iou, val_count = 0.0, 0
+        val_iou = 0.0
+        val_count = 0
+
         with torch.no_grad():
             for imgs, masks, _ in val_loader:
                 imgs, masks = imgs.to(device), masks.to(device)
+
                 logits = model(imgs)                      # [1,2,512,512]
-                probs  = torch.sigmoid(logits)[0, 1]      # [512,512]
-                true   = masks[0, 1]                      # [512,512], 1.0/0.0
+                probs  = torch.sigmoid(logits)[0, 1]      # squeeze batch, pick channel=1
+                true   = masks[0, 1]                      # ground‐truth transformer mask
 
                 pred_bin = (probs > 0.5).float()
                 inter    = (pred_bin * true).sum().item()
@@ -217,9 +253,9 @@ def train_model(args):
                 val_count += 1
 
         avg_val_iou = val_iou / val_count
-        print(f"Epoch {epoch}/{args.epochs} - Val IoU: {avg_val_iou:.4f}")
+        print(f"Epoch {epoch}/{args.epochs} → Val IoU: {avg_val_iou:.4f}")
 
-        # 6) Checkpoint if validation IoU improved
+        # 7) Checkpoint if validation IoU improved
         ckpt_name = f"model_epoch{epoch}_valIoU{avg_val_iou:.4f}.pth"
         ckpt_path = os.path.join(args.log_dir, ckpt_name)
         os.makedirs(args.log_dir, exist_ok=True)
@@ -229,7 +265,7 @@ def train_model(args):
             torch.save(model.state_dict(), ckpt_path)
             print(f"  → New best model saved: {ckpt_name}")
 
-    print(f"Training complete. Best Val IoU: {best_val_iou:.4f}")
+    print(f"\nTraining complete. Best Val IoU: {best_val_iou:.4f}")
 
 
 # ---------------------------
@@ -237,17 +273,32 @@ def train_model(args):
 # ---------------------------
 def parse_args():
     p = argparse.ArgumentParser()
-    p.add_argument('--images_dir',  required=True)
-    p.add_argument('--coco_json',   required=True)
+
+    # Train split
+    p.add_argument('--train_images_dir', type=str, required=True,
+                   help='Path to folder of training images (e.g. Dataset/train)')
+    p.add_argument('--train_coco_json',  type=str, required=True,
+                   help='Path to COCO JSON for training (e.g. Dataset/train/_annotations.coco.json)')
+
+    # Validation split
+    p.add_argument('--val_images_dir', type=str, required=True,
+                   help='Path to folder of validation images (e.g. Dataset/valid)')
+    p.add_argument('--val_coco_json',  type=str, required=True,
+                   help='Path to COCO JSON for validation (e.g. Dataset/valid/_annotations.coco.json)')
+
+    # Training hyperparameters
     p.add_argument('--batch_size',  type=int, default=8)
     p.add_argument('--lr',          type=float, default=1e-4)
     p.add_argument('--epochs',      type=int, default=50)
     p.add_argument('--num_workers', type=int, default=4)
-    p.add_argument('--val_split',   type=str, default='valid',
-                   help="Folder name for validation (e.g. 'valid' if images in train→valid).")
-    p.add_argument('--device',      type=str, default='auto', choices=['auto','cpu','cuda'])
-    p.add_argument('--dry_run',     action='store_true', help='Perform a single batch test and exit')
-    p.add_argument('--log_dir',     type=str, default='runs', help='Where to save checkpoints')
+
+    # Device & logging
+    p.add_argument('--device',      type=str, default='auto', choices=['auto', 'cpu', 'cuda'])
+    p.add_argument('--dry_run',     action='store_true',
+                   help='Perform a single batch test and exit')
+    p.add_argument('--log_dir',     type=str, default='runs',
+                   help='Directory in which to save best‐IoU checkpoints')
+
     return p.parse_args()
 
 
