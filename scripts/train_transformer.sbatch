@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=subseg_train
+#SBATCH --job-name=subseg_train2
 #SBATCH --output=/home/users/s/seifdak/Master-Thesis/logs/train_%j.out
 #SBATCH --error=/home/users/s/seifdak/Master-Thesis/logs/train_%j.err
 #SBATCH --partition=gpu
@@ -26,6 +26,6 @@ srun python ~/Master-Thesis/electrical_substation_segmentation.py \
      --lr 1e-4 \
      --epochs 50 \
      --num_workers 8 \
-     --val_split validation \
+     --val_split valid \
      --device cuda \
-     --log_dir ~/Master-Thesis/runs/exp1
+     --log_dir ~/Master-Thesis/runs/exp2
