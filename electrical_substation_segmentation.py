@@ -1,19 +1,18 @@
 """
-electrical_substation_segmentation.py
-
-Single-script training pipeline for transformer segmentation using PyTorch and Albumentations.
-Supports dry-run, model saving, and TensorBoard logging.
+Single‐script training pipeline for transformer segmentation using PyTorch and Albumentations.
+Uses a combined BCE + Dice loss and runs a validation loop each epoch to track IoU.
 Usage:
-    python train_all.py \
+    python electrical_substation_segmentation.py \
         --images_dir /path/to/train/images \
         --coco_json /path/to/annotations.json \
         --batch_size 8 \
         --lr 1e-4 \
         --epochs 50 \
         --num_workers 4 \
-        --val_split validation \
-        [--device cuda] [--dry_run] [--log_dir runs]
+        --val_split valid \
+        [--device cuda] [--dry_run]
 """
+
 import os
 import json
 import argparse
@@ -23,7 +22,6 @@ import numpy as np
 import torch
 from torch import nn, optim
 from torch.utils.data import Dataset, DataLoader
-from torch.utils.tensorboard import SummaryWriter
 import segmentation_models_pytorch as smp
 import albumentations as A
 from glob import glob
@@ -32,9 +30,7 @@ from glob import glob
 # Configuration
 # ---------------------------
 IMG_SIZE = 512
-ENCODER = 'resnet34'
-
-# Prepare preprocessing function
+ENCODER = 'resnet50'
 PREPROCESS_FN = smp.encoders.get_preprocessing_fn(ENCODER, 'imagenet')
 
 # ---------------------------
@@ -60,6 +56,7 @@ def get_validation_augmentation():
         A.CenterCrop(height=IMG_SIZE, width=IMG_SIZE, p=1),
     ], additional_targets={'mask': 'mask'})
 
+
 # ---------------------------
 # Dataset Definition
 # ---------------------------
@@ -68,15 +65,18 @@ class SubstationDataset(Dataset):
         self.image_paths = sorted(
             glob(os.path.join(images_dir, '*.png')) + glob(os.path.join(images_dir, '*.jpg'))
         )
+        # Load COCO JSON
         with open(coco_json, 'r') as f:
             coco = json.load(f)
+        # Find transformer category
         transformer = next(c for c in coco['categories'] if c['name'].lower()=='transformer')
-        self.transformer_id = transformer['id']
+        self.tid = transformer['id']
+        # Group annotations by image id
         self.anns_by_image = {}
         for ann in coco['annotations']:
-            if ann['category_id']==self.transformer_id:
+            if ann['category_id'] == self.tid:
                 self.anns_by_image.setdefault(ann['image_id'], []).append(ann)
-        self.imgname_to_id = {img['file_name']: img['id'] for img in coco['images']}
+        self.name2id = {img['file_name']: img['id'] for img in coco['images']}
         self.augmentation = augmentation
         self.preprocessing_fn = preprocessing_fn
 
@@ -84,11 +84,13 @@ class SubstationDataset(Dataset):
         return len(self.image_paths)
 
     def __getitem__(self, idx):
+        # Load image
         img_path = self.image_paths[idx]
         filename = os.path.basename(img_path)
-        image_id = self.imgname_to_id[filename]
+        image_id = self.name2id[filename]
         image = cv2.cvtColor(cv2.imread(img_path), cv2.COLOR_BGR2RGB)
         h, w = image.shape[:2]
+        # Build binary mask
         mask = np.zeros((h, w), dtype=np.uint8)
         for ann in self.anns_by_image.get(image_id, []):
             if 'segmentation' in ann and isinstance(ann['segmentation'], list):
@@ -96,73 +98,139 @@ class SubstationDataset(Dataset):
                     pts = np.array(seg).reshape(-1,2).astype(np.int32)
                     cv2.fillPoly(mask, [pts], 1)
             else:
-                x,y,bw,bh = map(int, ann['bbox'])
-                cv2.rectangle(mask, (x,y), (x+bw, y+bh), 1, -1)
+                x, y, bw, bh = map(int, ann['bbox'])
+                cv2.rectangle(mask, (x, y), (x + bw, y + bh), 1, -1)
+        # One-hot encode: [background, transformer]
         mask = mask.astype('float32')
         bg = 1.0 - mask
         mask = np.stack([bg, mask], axis=-1)
+        # Augment & preprocess
         if self.augmentation:
             data = self.augmentation(image=image, mask=mask)
             image, mask = data['image'], data['mask']
         if self.preprocessing_fn:
             image = self.preprocessing_fn(image)
-        image = image.astype('float32').transpose(2,0,1)
-        mask  = mask.astype('float32').transpose(2,0,1)
-        return torch.from_numpy(image), torch.from_numpy(mask)
+        # Convert to CHW
+        image = image.astype('float32').transpose(2, 0, 1)
+        mask  = mask.astype('float32').transpose(2, 0, 1)
+        return torch.from_numpy(image), torch.from_numpy(mask), filename
+
 
 # ---------------------------
-# Training Routine
+# Training & Validation Routines
 # ---------------------------
 def train_model(args):
-    device = torch.device('cuda' if args.device=='cuda' and torch.cuda.is_available() else 'cpu')
+    # 1) Set up device
+    if args.device == 'auto':
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    else:
+        device = torch.device(args.device)
     print(f"Using device: {device}")
 
-    # prepare TensorBoard writer and checkpoint dir
-    os.makedirs(args.log_dir, exist_ok=True)
-    writer = SummaryWriter(log_dir=args.log_dir)
-
+    # 2) DataLoaders
     train_dir = args.images_dir
     val_dir   = train_dir.replace('train', args.val_split)
+
+    train_ds = SubstationDataset(
+        images_dir=train_dir,
+        coco_json=args.coco_json,
+        augmentation=get_training_augmentation(),
+        preprocessing_fn=PREPROCESS_FN
+    )
+    val_ds = SubstationDataset(
+        images_dir=val_dir,
+        coco_json=args.coco_json,
+        augmentation=get_validation_augmentation(),
+        preprocessing_fn=PREPROCESS_FN
+    )
+
     train_loader = DataLoader(
-        SubstationDataset(train_dir, args.coco_json, get_training_augmentation(), PREPROCESS_FN),
-        batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers, pin_memory=True)
-    val_loader = DataLoader(
-        SubstationDataset(val_dir, args.coco_json, get_validation_augmentation(), PREPROCESS_FN),
-        batch_size=1, shuffle=False, num_workers=args.num_workers, pin_memory=True)
+        train_ds, batch_size=args.batch_size, shuffle=True,
+        num_workers=args.num_workers, pin_memory=True
+    )
+    val_loader   = DataLoader(
+        val_ds,   batch_size=1, shuffle=False,
+        num_workers=args.num_workers, pin_memory=True
+    )
 
-    model = smp.Unet(encoder_name=ENCODER, encoder_weights='imagenet', in_channels=3, classes=2).to(device)
-    criterion = nn.BCEWithLogitsLoss()
+    # 3) Model, loss, optimizer
+    model = smp.Unet(
+        encoder_name=ENCODER,
+        encoder_weights='imagenet',
+        in_channels=3,
+        classes=2
+    )
+    model.to(device)
+
+    # Composite loss: BCEWithLogits + Dice
+    bce_loss  = nn.BCEWithLogitsLoss()
+    dice_loss = smp.losses.DiceLoss(mode='binary')
+    # Optionally you could also add a focal term:
+    # focal_loss = smp.losses.BinaryFocalLoss(alpha=0.75, gamma=2)
+    # total_loss = bce_loss + dice_loss + focal_loss
+
     optimizer = optim.Adam(model.parameters(), lr=args.lr)
-    best_loss = float('inf')
 
-    # optionally test a single batch
+    best_val_iou = 0.0
+
+    # Dry run? Test a single batch and exit
     if args.dry_run:
-        imgs, masks = next(iter(train_loader))
-        preds = model(imgs.to(device))
+        imgs, masks, _ = next(iter(train_loader))
+        imgs, masks = imgs.to(device), masks.to(device)
+        preds = model(imgs)
         print(f"Dry run shapes -> imgs: {imgs.shape}, masks: {masks.shape}, preds: {preds.shape}")
         sys.exit(0)
 
-    # main loop
-    for epoch in range(1, args.epochs+1):
+    # 4) Main training loop
+    for epoch in range(1, args.epochs + 1):
         model.train()
-        train_loss = 0.0
-        for imgs, masks in train_loader:
+        total_loss, count = 0.0, 0
+        for imgs, masks, _ in train_loader:
             imgs, masks = imgs.to(device), masks.to(device)
-            preds = model(imgs)
-            loss = criterion(preds, masks)
+            preds = model(imgs)                        # [B,2,512,512]
+            loss  = bce_loss(preds, masks) + dice_loss(preds, masks)
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
-            train_loss += loss.item()
-        train_loss /= len(train_loader)
-        writer.add_scalar('Loss/Train', train_loss, epoch)
+            total_loss += loss.item()
+            count += 1
 
-        # checkpoint after each epoch
-        ckpt_file = os.path.join(args.log_dir, f'model_epoch{epoch}_loss{train_loss:.4f}.pth')
-        torch.save(model.state_dict(), ckpt_file)
-        print(f"Epoch {epoch}/{args.epochs} - Loss: {train_loss:.4f} (saved {ckpt_file})")
+        avg_train_loss = total_loss / count
+        print(f"Epoch {epoch}/{args.epochs} - Train Loss: {avg_train_loss:.4f}")
 
-    writer.close()
+        # 5) Validation loop (compute IoU on “transformer” channel)
+        model.eval()
+        val_iou, val_count = 0.0, 0
+        with torch.no_grad():
+            for imgs, masks, _ in val_loader:
+                imgs, masks = imgs.to(device), masks.to(device)
+                logits = model(imgs)                      # [1,2,512,512]
+                probs  = torch.sigmoid(logits)[0, 1]      # [512,512]
+                true   = masks[0, 1]                      # [512,512], 1.0/0.0
+
+                pred_bin = (probs > 0.5).float()
+                inter    = (pred_bin * true).sum().item()
+                union    = ((pred_bin + true) > 0).sum().item()
+                iou      = inter / union if union > 0 else 1.0
+
+                val_iou += iou
+                val_count += 1
+
+        avg_val_iou = val_iou / val_count
+        print(f"Epoch {epoch}/{args.epochs} - Val IoU: {avg_val_iou:.4f}")
+
+        # 6) Checkpoint if validation IoU improved
+        ckpt_name = f"model_epoch{epoch}_valIoU{avg_val_iou:.4f}.pth"
+        ckpt_path = os.path.join(args.log_dir, ckpt_name)
+        os.makedirs(args.log_dir, exist_ok=True)
+
+        if avg_val_iou > best_val_iou:
+            best_val_iou = avg_val_iou
+            torch.save(model.state_dict(), ckpt_path)
+            print(f"  → New best model saved: {ckpt_name}")
+
+    print(f"Training complete. Best Val IoU: {best_val_iou:.4f}")
+
 
 # ---------------------------
 # Argument Parsing
@@ -175,11 +243,13 @@ def parse_args():
     p.add_argument('--lr',          type=float, default=1e-4)
     p.add_argument('--epochs',      type=int, default=50)
     p.add_argument('--num_workers', type=int, default=4)
-    p.add_argument('--val_split',   type=str, default='validation')
+    p.add_argument('--val_split',   type=str, default='valid',
+                   help="Folder name for validation (e.g. 'valid' if images in train→valid).")
     p.add_argument('--device',      type=str, default='auto', choices=['auto','cpu','cuda'])
-    p.add_argument('--dry_run',     action='store_true')
-    p.add_argument('--log_dir',     type=str, default='runs', help='Log & checkpoint directory')
+    p.add_argument('--dry_run',     action='store_true', help='Perform a single batch test and exit')
+    p.add_argument('--log_dir',     type=str, default='runs', help='Where to save checkpoints')
     return p.parse_args()
+
 
 if __name__ == '__main__':
     args = parse_args()
