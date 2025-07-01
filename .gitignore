@@ -175,6 +175,8 @@ cython_debug/
 
 # Data files
 Dataset/
+add_data/
+Docs/
 runs/
 logs/
 validation_overlays/

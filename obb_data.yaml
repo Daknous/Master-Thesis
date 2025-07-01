@@ -1,0 +1,7 @@
+path: /Users/zif/Documents/Substation_Master_thesis/Master-Thesis/Dataset
+train: /Users/zif/Documents/Substation_Master_thesis/Master-Thesis/Dataset/train/images
+val: /Users/zif/Documents/Substation_Master_thesis/Master-Thesis/Dataset/valid/images
+test: /Users/zif/Documents/Substation_Master_thesis/Master-Thesis/Dataset/test/images
+names:
+  0: transformer
+robust: true
