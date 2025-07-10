@@ -111,7 +111,7 @@ def main():
                 val_iou += iou_score(preds, truths, threshold=METRIC_THRESHOLD)
         avg_val_iou = val_iou / len(val_loader)
         scheduler.step(avg_val_iou)
-        print(f"Epoch {epoch} → Val IoU: {avg_val_iou:.4f} | LR: {scheduler.get_last_lr():.6f}")
+        print(f"Epoch {epoch} → Val IoU: {avg_val_iou:.4f} | LR: {scheduler.get_last_lr()[0]:.6f}")
 
         # Log metrics
         log_metrics({'train/loss': avg_train_loss, 'val/iou': avg_val_iou}, step=epoch)
