@@ -20,13 +20,13 @@ pip install --upgrade --no-cache-dir -r ~/Master-Thesis/requirements.txt
 cd ~/Master-Thesis
 
 srun python ~/Master-Thesis/electrical_substation_segmentation.py \
-     --train_images_dir  ~/Master-Thesis/Dataset/train \
-     --train_coco_json   ~/Master-Thesis/Dataset/train/_annotations.coco.json \
+     --train_images_dir  ~/Master-Thesis/Dataset/train_filtered \
+     --train_coco_json   ~/Master-Thesis/Dataset/train_filtered/_annotations.coco.json \
      --val_images_dir    ~/Master-Thesis/Dataset/valid \
      --val_coco_json     ~/Master-Thesis/Dataset/valid/_annotations.coco.json \
      --batch_size 8 \
      --lr 1e-4 \
-     --epochs 50 \
-     --num_workers 8 \
+     --epochs 250 \
+     --num_workers 4 \
      --device cuda \
-     --log_dir ~/Master-Thesis/runs/exp2
+     --log_dir ~/Master-Thesis/runs/exp5
