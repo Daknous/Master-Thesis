@@ -1,0 +1,14 @@
+dataset:
+  root: Dataset
+  train:
+    images: train
+    coco_json: train/_annotations.coco.json
+  valid:
+    images: valid
+    coco_json: valid/_annotations.coco.json
+  test:
+    images: test
+    coco_json: test/_annotations.coco.json
+
+metrics:
+  threshold: 0.6
