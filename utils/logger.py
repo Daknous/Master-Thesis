@@ -5,22 +5,25 @@ def init_wandb(
     project_name: str,
     config: dict,
     run_name: str = None,
-    entity: str = None
+    entity: str = None,
+    tags: list[str] = None
 ) -> None:
     """
-    Initializes a Weights & Biases run.
+    Initializes a Weights & Biases run with optional tags.
 
     Args:
         project_name: Name of the W&B project.
         config: Dictionary of hyperparameters/configuration to log.
         run_name: Optional name for this run.
         entity: Optional W&B entity (team or user name).
+        tags: Optional list of string tags for the run.
     """
     wandb.init(
         project=project_name,
         config=config,
         name=run_name,
         entity=entity,
+        tags=tags,
         reinit=True
     )
 
@@ -49,7 +52,7 @@ def log_image(
     key: str = "prediction"
 ) -> None:
     """
-    Logs an image to W&B with caption.
+    Logs an image to W&B with a caption.
 
     Args:
         image: Image tensor or numpy array.
