@@ -24,6 +24,7 @@ export WANDB_API_KEY=$(< ~/.wandb_api_key)
 python main.py \
      --batch_size 8 \
      --lr 1e-4 \
+     --tags dropout_0.2 TestAndBuild \
      --epochs 50 \
      --num_workers 8 \
      --device cuda \

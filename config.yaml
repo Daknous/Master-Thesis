@@ -1,8 +1,8 @@
 dataset:
   root: Dataset
   train:
-    images: train
-    coco_json: train/_annotations.coco.json
+    images: train_filtered
+    coco_json: train_filtered/_annotations.coco.json
   valid:
     images: valid
     coco_json: valid/_annotations.coco.json

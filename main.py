@@ -17,6 +17,8 @@ from models.unet import get_model, get_criterion, get_optimizer
 from utils.metrics import iou_score
 from utils.logger import init_wandb, log_metrics, log_image
 from settings.config import METRIC_THRESHOLD
+from helper.preprocessing import ENCODER
+
 
 
 def parse_args():
@@ -79,7 +81,13 @@ def main():
     )
 
     # Model, criterion, optimizer, scheduler
-    model     = get_model(device, dropout=args.dropout)
+
+    model     = get_model(device,            # torch device
+                        encoder_name=ENCODER, 
+                        encoder_weights='imagenet',
+                        in_channels=3,
+                        classes=2,
+                        dropout=args.dropout)
     criterion = get_criterion()
     optimizer = get_optimizer(model, lr=args.lr)
     scheduler = OneCycleLR(
@@ -168,15 +176,26 @@ def main():
             imgs_vis, masks_vis = imgs_vis.to(device), masks_vis.to(device)
             with torch.no_grad():
                 logits_vis = model(imgs_vis)
-                preds_vis  = torch.softmax(logits_vis, dim=1)[:,1] if logits_vis.shape[1]>1 else torch.sigmoid(logits_vis[:,0])
-            truths_vis = masks_vis[:,1] if masks_vis.ndim==4 else masks_vis
+                preds_vis  = (torch.softmax(logits_vis, dim=1)[:,1]
+                            if logits_vis.shape[1] > 1
+                            else torch.sigmoid(logits_vis[:,0]))
+            truths_vis = (masks_vis[:,1] if masks_vis.ndim == 4 else masks_vis)
+
             for idx in range(min(3, imgs_vis.size(0))):
-                # Log original image, ground truth, and prediction mask
-                overlay = torch.stack([
-                    imgs_vis[idx].cpu(),
-                    truths_vis[idx].unsqueeze(0).cpu(),
-                    (preds_vis[idx] > METRIC_THRESHOLD).float().unsqueeze(0).cpu()
-                ], dim=0)
+                # 3-channel RGB image
+                img_chw   = imgs_vis[idx].cpu()                          # [3,H,W]
+                # 1-channel ground truth and prediction
+                gt_mask   = truths_vis[idx].unsqueeze(0).cpu()           # [1,H,W]
+                pred_mask = (preds_vis[idx] > METRIC_THRESHOLD) \
+                            .float() \
+                            .unsqueeze(0)                                # [1,H,W]
+
+                # Repeat masks to 3 channels
+                gt_3ch    = gt_mask.repeat(3, 1, 1)                      # [3,H,W]
+                pred_3ch  = pred_mask.repeat(3, 1, 1)                    # [3,H,W]
+
+                # Stack as 3 entries, each [3×H×W]: image, GT, pred
+                overlay = torch.stack([img_chw, gt_3ch, pred_3ch], dim=0)
                 log_image(
                     image=overlay,
                     caption=f"GT vs Pred (idx={idx})",

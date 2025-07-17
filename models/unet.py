@@ -1,63 +1,69 @@
 import torch
 import torch.nn as nn
 import segmentation_models_pytorch as smp
-
-# A quick sanity-check UNet wrapper: applies final-layer dropout
-class UnetWithDecoderDropout(smp.Unet):
-    def __init__(
-        self,
-        encoder_name: str,
-        encoder_weights: str,
-        in_channels: int,
-        classes: int,
-        dropout: float = 0.0,
-        **kwargs
-    ):
-        super().__init__(
-            encoder_name=encoder_name,
-            encoder_weights=encoder_weights,
-            in_channels=in_channels,
-            classes=classes,
-            **kwargs
-        )
-        # Dropout applied to the final mask logits
-        self.dropout_final = nn.Dropout2d(dropout) if dropout > 0 else nn.Identity()
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Run the standard SMP UNet forward (encoder -> decoder -> segmentation_head)
-        masks = super().forward(x)
-        # Apply dropout to the final logits
-        return self.dropout_final(masks)
-
-# Factory functions for main.py
 from helper.preprocessing import ENCODER
-from settings.config import INPUT_CHANNELS, NUM_CLASSES
 
-def get_model(device: torch.device, dropout: float = 0.0) -> nn.Module:
-    model = UnetWithDecoderDropout(
-        encoder_name=ENCODER,
-        encoder_weights='imagenet',
-        in_channels=INPUT_CHANNELS,
-        classes=NUM_CLASSES,
-        dropout=dropout
+
+def get_model(
+    device: torch.device,
+    encoder_name: str = ENCODER,
+    encoder_weights: str = 'imagenet',
+    in_channels: int = 3,
+    classes: int = 2,
+    dropout: float = 0.0
+) -> nn.Module:
+    """
+    Returns an SMP U-Net model with optional Dropout2d applied
+    before the final segmentation head.
+
+    Args:
+        device: torch device to move the model to.
+        encoder_name: name of backbone encoder (e.g. 'resnet34').
+        encoder_weights: pretrained weights (e.g. 'imagenet' or None).
+        in_channels: number of input channels (e.g. 3 for RGB).
+        classes: number of output channels (e.g. 2 for background + mask).
+        dropout: dropout probability to apply before segmentation head.
+    """
+    # Instantiate base U-Net
+    model = smp.Unet(
+        encoder_name=encoder_name,
+        encoder_weights=encoder_weights,
+        in_channels=in_channels,
+        classes=classes,
+        activation=None
     )
+
+    # Inject Dropout2d before the final head if requested
+    if dropout and dropout > 0.0:
+        orig_head = model.segmentation_head
+        dropout_layer = nn.Dropout2d(p=dropout)
+        model.segmentation_head = nn.Sequential(dropout_layer, orig_head)
+
+    # Move to device
     return model.to(device)
 
 
 def get_criterion() -> nn.Module:
-    # Composite loss: BCEWithLogits + Dice
-    bce_loss = nn.BCEWithLogitsLoss()
-    dice_loss = smp.losses.DiceLoss(mode='binary')
+    """
+    Composite loss combining BCEWithLogits and Dice loss.
+    """
+    bce = nn.BCEWithLogitsLoss()
+    dice = smp.losses.DiceLoss(mode='binary')
+
     class CompositeLoss(nn.Module):
         def __init__(self):
             super().__init__()
-            self.bce = bce_loss
-            self.dice = dice_loss
+            self.bce = bce
+            self.dice = dice
+
         def forward(self, preds, targets):
             return self.bce(preds, targets) + self.dice(preds, targets)
+
     return CompositeLoss()
 
 
 def get_optimizer(model: torch.nn.Module, lr: float) -> torch.optim.Optimizer:
-    # Use AdamW with a small weight decay
+    """
+    Returns an AdamW optimizer with a small weight decay.
+    """
     return torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
