@@ -1,7 +1,5 @@
 import segmentation_models_pytorch as smp
-
-# Encoder name must match the one used in models.py
-ENCODER = 'resnet34'
+from settings.config import ENCODER
 
 
 def get_preprocessing_fn():

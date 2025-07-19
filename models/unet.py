@@ -1,12 +1,13 @@
 import torch
 import torch.nn as nn
 import segmentation_models_pytorch as smp
-from helper.preprocessing import ENCODER
+from segmentation_models_pytorch.losses import FocalLoss
+
 
 
 def get_model(
     device: torch.device,
-    encoder_name: str = ENCODER,
+    encoder_name: str,
     encoder_weights: str = 'imagenet',
     in_channels: int = 3,
     classes: int = 2,
@@ -45,19 +46,24 @@ def get_model(
 
 def get_criterion() -> nn.Module:
     """
-    Composite loss combining BCEWithLogits and Dice loss.
+    Composite loss combining BCEWithLogits, Dice, and Focal loss.
     """
-    bce = nn.BCEWithLogitsLoss()
-    dice = smp.losses.DiceLoss(mode='binary')
+    bce   = nn.BCEWithLogitsLoss()
+    dice  = smp.losses.DiceLoss(mode='binary')
+    focal = FocalLoss(mode='binary', alpha=0.5, gamma=2.0)
 
     class CompositeLoss(nn.Module):
         def __init__(self):
             super().__init__()
-            self.bce = bce
-            self.dice = dice
+            self.bce   = bce
+            self.dice  = dice
+            self.focal = focal
 
         def forward(self, preds, targets):
-            return self.bce(preds, targets) + self.dice(preds, targets)
+            loss_bce   = self.bce(preds, targets)
+            loss_dice  = self.dice(preds, targets)
+            loss_focal = self.focal(preds, targets)
+            return loss_bce + loss_dice + loss_focal
 
     return CompositeLoss()
 

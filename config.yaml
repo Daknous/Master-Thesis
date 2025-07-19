@@ -1,8 +1,8 @@
 dataset:
-  root: Dataset
+  root: Dataset_v2_filtered
   train:
-    images: train_filtered
-    coco_json: train_filtered/_annotations.coco.json
+    images: train
+    coco_json: train/_annotations.coco.json
   valid:
     images: valid
     coco_json: valid/_annotations.coco.json
@@ -12,3 +12,5 @@ dataset:
 
 metrics:
   threshold: 0.6
+
+encoder: resnet50

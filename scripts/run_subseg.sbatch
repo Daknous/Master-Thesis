@@ -10,7 +10,7 @@
 #SBATCH --mem=8G
 #SBATCH --gres=gpu:1
 
-#SBATCH --time=01:30:00
+#SBATCH --time=5:00:00
 #SBATCH --mail-type=END,FAIL
 #SBATCH --mail-user=seif.daknou@campus.tu-berlin.de
 
@@ -31,10 +31,10 @@ export WANDB_API_KEY=$(< ~/.wandb_api_key)
 python main.py \
      --batch_size 8 \
      --lr 1e-4 \
-     --tags dropout_0.2 \
+     --tags dropout_0.2 and focal_loss resnet50 \
      --epochs 50 \
      --num_workers 8 \
      --device cuda \
-     --log_dir ~/Master-Thesis/runs \
+     --log_dir ~/Master-Thesis/runs/resnet50 \
      --wandb_project substation-segmentation \
      --wandb_entity seif-daknou-technical-university-of-berlin

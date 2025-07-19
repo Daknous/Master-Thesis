@@ -32,10 +32,10 @@ from collections import defaultdict
 # ---------------------------
 # Configuration
 # ---------------------------
-IMG_SIZE = 640
+IMG_SIZE = 1200
 ENCODER = 'resnet34'  # or 'efficientnet-b3', 'resnet50', etc.
 PREPROCESS_FN = smp.encoders.get_preprocessing_fn(ENCODER, 'imagenet')
-#os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 # ---------------------------
 # Custom Augmentation Transforms
 # ---------------------------
@@ -302,7 +302,7 @@ def train_model(args):
     dice_loss = smp.losses.DiceLoss(mode='binary')
     optimizer = optim.Adam(model.parameters(), lr=args.lr)
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode='min', factor=0.7, patience=10, verbose=True
+        optimizer, mode='min', factor=0.7, patience=25, verbose=True
     )
 
     best_val_iou = 0.0

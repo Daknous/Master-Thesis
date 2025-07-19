@@ -50,6 +50,8 @@ TEST_COCO_JSON = os.path.join(
 
 METRIC_THRESHOLD = cfg['metrics']['threshold']
 
+ENCODER = cfg.get('encoder', 'resnet34')  # Default to resnet34 if not specified
+
 # === Other settings placeholders ===
 # CKPT_DIR = os.path.join(PROJECT_ROOT, 'checkpoints')
 # LOG_DIR = os.path.join(PROJECT_ROOT, 'logs')

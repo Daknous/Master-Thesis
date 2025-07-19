@@ -10,10 +10,10 @@
 
 module load python/3.9.19
 source ~/scratch/subseg_venv/bin/activate
-#. ~/Master-Thesis/env_subseg/bin/activate
-pip install --upgrade --no-cache-dir -r ~/Master-Thesis/requirements.txt
-which python
-python -c "import torch; print('Torch OK:', torch.__version__)"
+# . ~/Master-Thesis/env_subseg/bin/activate
+# pip install --upgrade --no-cache-dir -r ~/Master-Thesis/requirements.txt
+# which python
+# python -c "import torch; print('Torch OK:', torch.__version__)"
 
 cd ~/Master-Thesis
 
@@ -24,10 +24,11 @@ export WANDB_API_KEY=$(< ~/.wandb_api_key)
 python main.py \
      --batch_size 8 \
      --lr 1e-4 \
-     --tags dropout_0.2 TestAndBuild \
+     --tags dropout_0.2 TestAndBuild focal_loss resnet50 \
+     --dropout 0.2 \
      --epochs 50 \
      --num_workers 8 \
-     --device cuda \
-     --log_dir ~/Master-Thesis/runs \
+     --device cpu \
+     --log_dir ~/Master-Thesis/runs/resnet50 \
      --wandb_project substation-segmentation \
      --wandb_entity seif-daknou-technical-university-of-berlin
