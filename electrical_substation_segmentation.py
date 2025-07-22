@@ -33,7 +33,7 @@ import albumentations as A
 # ---------------------------
 # Configuration
 # ---------------------------
-IMG_SIZE = 640
+IMG_SIZE = 1200
 ENCODER = 'resnet34'  # or 'efficientnet-b3', 'resnet50', etc.
 PREPROCESS_FN = smp.encoders.get_preprocessing_fn(ENCODER, 'imagenet')
 

@@ -1,75 +1,89 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import segmentation_models_pytorch as smp
-from segmentation_models_pytorch.losses import FocalLoss
 
+# UNet for binary segmentation with single channel output
+class UnetWithDecoderDropout(smp.Unet):
+    def __init__(
+        self,
+        encoder_name: str,
+        encoder_weights: str,
+        in_channels: int,
+        classes: int,
+        dropout: float = 0.0,
+        **kwargs
+    ):
+        super().__init__(
+            encoder_name=encoder_name,
+            encoder_weights=encoder_weights,
+            in_channels=in_channels,
+            classes=classes,
+            **kwargs
+        )
+        # Dropout applied to the final mask logits
+        self.dropout_final = nn.Dropout2d(dropout) if dropout > 0 else nn.Identity()
 
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Run the standard SMP UNet forward (encoder -> decoder -> segmentation_head)
+        masks = super().forward(x)
+        # Apply dropout to the final logits
+        return self.dropout_final(masks)
 
-def get_model(
-    device: torch.device,
-    encoder_name: str,
-    encoder_weights: str = 'imagenet',
-    in_channels: int = 3,
-    classes: int = 2,
-    dropout: float = 0.0
-) -> nn.Module:
+# Factory functions for main.py
+from helper.preprocessing import ENCODER
+
+def get_model(device: torch.device, dropout: float = 0.0) -> nn.Module:
     """
-    Returns an SMP U-Net model with optional Dropout2d applied
-    before the final segmentation head.
-
-    Args:
-        device: torch device to move the model to.
-        encoder_name: name of backbone encoder (e.g. 'resnet34').
-        encoder_weights: pretrained weights (e.g. 'imagenet' or None).
-        in_channels: number of input channels (e.g. 3 for RGB).
-        classes: number of output channels (e.g. 2 for background + mask).
-        dropout: dropout probability to apply before segmentation head.
+    Create binary segmentation model with single channel output.
     """
-    # Instantiate base U-Net
-    model = smp.Unet(
-        encoder_name=encoder_name,
-        encoder_weights=encoder_weights,
-        in_channels=in_channels,
-        classes=classes,
-        activation=None
+    model = UnetWithDecoderDropout(
+        encoder_name=ENCODER,
+        encoder_weights='imagenet',
+        in_channels=3,
+        classes=1,  # Single channel for binary segmentation
+        dropout=dropout
     )
-
-    # Inject Dropout2d before the final head if requested
-    if dropout and dropout > 0.0:
-        orig_head = model.segmentation_head
-        dropout_layer = nn.Dropout2d(p=dropout)
-        model.segmentation_head = nn.Sequential(dropout_layer, orig_head)
-
-    # Move to device
     return model.to(device)
 
 
+class BinarySegmentationLoss(nn.Module):
+    """
+    Combined loss for binary segmentation.
+    Uses BCE + Dice loss for single channel output.
+    """
+    def __init__(self, bce_weight=1.0, dice_weight=1.0):
+        super().__init__()
+        self.bce_weight = bce_weight
+        self.dice_weight = dice_weight
+        
+    def forward(self, logits, targets):
+        """
+        Args:
+            logits: [B, 1, H, W] - raw logits from model
+            targets: [B, H, W] - binary targets (0 for background, 1 for foreground)
+        """
+        # Squeeze logits to match target dimensions
+        logits = logits.squeeze(1)  # [B, H, W]
+        
+        # BCE Loss
+        bce_loss = F.binary_cross_entropy_with_logits(logits, targets)
+        
+        # Dice Loss
+        probs = torch.sigmoid(logits)
+        smooth = 1e-6
+        intersection = (probs * targets).sum()
+        dice_coeff = (2.0 * intersection + smooth) / (
+            probs.sum() + targets.sum() + smooth
+        )
+        dice_loss = 1.0 - dice_coeff
+        
+        return self.bce_weight * bce_loss + self.dice_weight * dice_loss
+
+
 def get_criterion() -> nn.Module:
-    """
-    Composite loss combining BCEWithLogits, Dice, and Focal loss.
-    """
-    bce   = nn.BCEWithLogitsLoss()
-    dice  = smp.losses.DiceLoss(mode='binary')
-    focal = FocalLoss(mode='binary', alpha=0.5, gamma=2.0)
-
-    class CompositeLoss(nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.bce   = bce
-            self.dice  = dice
-            self.focal = focal
-
-        def forward(self, preds, targets):
-            loss_bce   = self.bce(preds, targets)
-            loss_dice  = self.dice(preds, targets)
-            loss_focal = self.focal(preds, targets)
-            return loss_bce + loss_dice + loss_focal
-
-    return CompositeLoss()
+    return BinarySegmentationLoss(bce_weight=1.0, dice_weight=1.0)
 
 
 def get_optimizer(model: torch.nn.Module, lr: float) -> torch.optim.Optimizer:
-    """
-    Returns an AdamW optimizer with a small weight decay.
-    """
     return torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)

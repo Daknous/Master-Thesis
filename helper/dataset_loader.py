@@ -117,6 +117,7 @@ def get_validation_augmentation():
 class SubstationDataset(Dataset):
     """
     Dataset for transformer segmentation using COCO annotations.
+    Returns binary masks (single channel).
     """
     def __init__(self, images_dir, coco_json, augmentation=None):
         self.image_paths = sorted(glob.glob(os.path.join(images_dir, '*.png'))) + \
@@ -143,23 +144,29 @@ class SubstationDataset(Dataset):
         image_id = self.name2id[filename]
         img = cv2.cvtColor(cv2.imread(img_path), cv2.COLOR_BGR2RGB)
         h, w = img.shape[:2]
+        
+        # Create binary mask (single channel)
         mask = np.zeros((h, w), dtype=np.uint8)
         for polys in self.anns_by_image[image_id]:
             for poly in polys:
                 pts = np.array(poly, dtype=np.int32).reshape(-1, 2)
                 cv2.fillPoly(mask, [pts], 1)
-        fg = mask.astype(np.float32)
-        bg = 1.0 - fg
-        mask = np.stack([bg, fg], axis=-1)
-        # augmentation
+        
+        # Convert to float
+        mask = mask.astype(np.float32)
+        
+        # Apply augmentations
         if self.augmentation:
             data = self.augmentation(image=img, mask=mask)
             img, mask = data['image'], data['mask']
-        # preprocessing
+        
+        # Apply preprocessing
         img = self.preprocess_fn(img)
-        # to tensor CHW
-        img = img.astype(np.float32).transpose(2, 0, 1)
-        mask = mask.astype(np.float32).transpose(2, 0, 1)
+        
+        # Convert to tensor format: CHW for image, HW for mask
+        img = img.astype(np.float32).transpose(2, 0, 1)  # [C, H, W]
+        mask = mask.astype(np.float32)  # [H, W] - single channel binary mask
+        
         return torch.from_numpy(img), torch.from_numpy(mask)
 
 # === DataLoader Factory ===
