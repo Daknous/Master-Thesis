@@ -21,6 +21,8 @@ from settings.config import METRIC_THRESHOLD
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Train binary segmentation model.")
+    # General settings
+    parser.add_argument('--seed',         type=int,   default=42,    help='Random seed for reproducibility')
     # Training hyperparameters
     parser.add_argument('--batch_size',  type=int,   default=8,     help='Mini-batch size')
     parser.add_argument('--lr',          type=float, default=1e-4,  help='Initial learning rate')
@@ -31,11 +33,12 @@ def parse_args():
     parser.add_argument('--device',      type=str,   default='auto', choices=['auto','cpu','cuda'], help='Compute device')
     parser.add_argument('--dry_run',     action='store_true',        help='Perform a single batch test and exit')
     parser.add_argument('--log_dir',     type=str,   default='runs',  help='Directory to save experiment outputs')
+   # W&B configuration
     parser.add_argument('--wandb_project', type=str, default='substation-segmentation', help='W&B project name')
     parser.add_argument('--wandb_entity',  type=str, default=None,   help='W&B entity/team name')
-    parser.add_argument('--seed',         type=int,   default=42,    help='Random seed for reproducibility')
-    # W&B tags
-    parser.add_argument('--tags',        nargs='+', default=[],    help='List of W&B tags for this run')
+    parser.add_argument('--wandb_tags',        nargs='+', default=[],    help='List of W&B tags for this run')
+    parser.add_argument('--wandb_group', type=str, default=None, help='W&B group name for grouping runs')
+
     return parser.parse_args()
 
 
@@ -62,7 +65,8 @@ def main():
         config=vars(args),
         entity=args.wandb_entity,
         run_name=run_name,
-        tags=args.tags + ['binary_segmentation']
+        tags=args.wandb_tags + ['binary_segmentation'],
+        group=args.wandb_group
     )
 
     # Experiment directory under runs/

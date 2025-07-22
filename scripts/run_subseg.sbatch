@@ -30,7 +30,7 @@ export WANDB_API_KEY=$(< ~/.wandb_api_key)
 python main.py \
      --batch_size 4 \
      --lr 1e-4 \
-     --tags Test single_channel pixel_iou dice prec_rec \
+     --wandb_tags Test single_channel pixel_iou dice prec_rec \
      --epochs 10 \
      --num_workers 4 \
      --device cuda \

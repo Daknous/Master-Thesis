@@ -11,6 +11,6 @@ dataset:
     coco_json: test/_annotations.coco.json
 
 metrics:
-  threshold: 0.5
+  threshold: 0.4
 
 encoder: resnet34
