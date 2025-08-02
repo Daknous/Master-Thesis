@@ -6,7 +6,7 @@ from collections import defaultdict
 import cv2
 import numpy as np
 import torch
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
 
 import albumentations as A
 
@@ -18,7 +18,7 @@ from settings.config import (
 )
 
 # Image size constant
-IMG_SIZE = 640
+DEFAULT_IMG_SIZE = 1200
 
 # === Custom Augmentation Transforms ===
 class RandomCropWithMask(A.DualTransform):
@@ -94,23 +94,33 @@ class MaskAwareDropout(A.DualTransform):
         return ('max_holes','hole_frac','max_mask_overlap_frac','max_tries')
 
 # === Augmentation Pipelines ===
-def get_training_augmentation():
+def get_training_augmentation(img_size: int):
     return A.Compose([
-        A.Rotate(limit=360, p=0.5),
+        A.Rotate(limit=30, p=0.5),
         A.HorizontalFlip(p=0.5),
-        A.PadIfNeeded(min_height=IMG_SIZE, min_width=IMG_SIZE, border_mode=cv2.BORDER_REFLECT),
-        RandomCropWithMask(height=IMG_SIZE, width=IMG_SIZE, min_mask_frac=0.005, max_tries=5, p=1.0),
+        A.RandomResizedCrop(                       # <- FIXED
+            size=(img_size, img_size),             # keyword args
+            scale=(0.9, 1.0),                      # upper bound 1.0
+            ratio=(1.0, 1.0),                      # keep square patches
+            p=0.30
+        ),
+        A.PadIfNeeded(min_height=img_size, min_width=img_size, border_mode=cv2.BORDER_REFLECT),
+        A.Resize(img_size, img_size, interpolation=cv2.INTER_LINEAR),
+
+        # RandomCropWithMask(height=img_size, width=img_size, min_mask_frac=0.005, max_tries=5, p=1.0),
         A.RandomBrightnessContrast(brightness_limit=0.1, contrast_limit=0.1, p=0.3),
-        A.GaussianBlur(blur_limit=7, p=0.2),
+        # A.GaussianBlur(blur_limit=7, p=0.2),
         A.GaussNoise(p=0.2),
         MaskAwareDropout(max_holes=8, hole_frac=0.05, max_mask_overlap_frac=0.1, max_tries=10, p=0.3),
     ], additional_targets={'mask': 'mask'})
 
 
-def get_validation_augmentation():
+def get_validation_augmentation(img_size: int):
     return A.Compose([
-        A.PadIfNeeded(min_height=IMG_SIZE, min_width=IMG_SIZE, border_mode=cv2.BORDER_REFLECT, p=1),
-        A.CenterCrop(height=IMG_SIZE, width=IMG_SIZE, p=1),
+        A.PadIfNeeded(min_height=img_size, min_width=img_size, border_mode=cv2.BORDER_REFLECT, p=1),
+        A.Resize(img_size, img_size, interpolation=cv2.INTER_LINEAR),
+
+        # A.CenterCrop(height=img_size, width=img_size, p=1),
     ], additional_targets={'mask': 'mask'})
 
 # === Dataset Definition ===
@@ -170,27 +180,59 @@ class SubstationDataset(Dataset):
         return torch.from_numpy(img), torch.from_numpy(mask)
 
 # === DataLoader Factory ===
-def get_dataloaders(batch_size=8, num_workers=4, pin_memory=True):
+def get_dataloaders(batch_size=8, num_workers=4, pin_memory=True,
+                    img_size=DEFAULT_IMG_SIZE,
+                    use_sampler_weights=False):
+
+    # ------------------------------------------------------------------ #
+    # Build the three dataset objects
+    # ------------------------------------------------------------------ #
     train_ds = SubstationDataset(
         images_dir=TRAIN_IMAGES_DIR,
         coco_json=TRAIN_COCO_JSON,
-        augmentation=get_training_augmentation()
+        augmentation=get_training_augmentation(img_size)
     )
     valid_ds = SubstationDataset(
         images_dir=VALID_IMAGES_DIR,
         coco_json=VALID_COCO_JSON,
-        augmentation=get_validation_augmentation()
+        augmentation=get_validation_augmentation(img_size)
     )
     test_ds = SubstationDataset(
         images_dir=TEST_IMAGES_DIR,
         coco_json=TEST_COCO_JSON,
-        augmentation=get_validation_augmentation()
+        augmentation=get_validation_augmentation(img_size)
     )
-    return (
-        DataLoader(train_ds, batch_size=batch_size, shuffle=True,
-                   num_workers=num_workers, pin_memory=pin_memory),
-        DataLoader(valid_ds, batch_size=1, shuffle=False,
-                   num_workers=num_workers, pin_memory=pin_memory),
-        DataLoader(test_ds, batch_size=1, shuffle=False,
-                   num_workers=num_workers, pin_memory=pin_memory)
-    )
+
+    # ------------------------------------------------------------------ #
+    # TRAIN loader: either weighted-sampler or plain shuffle
+    # ------------------------------------------------------------------ #
+    if use_sampler_weights:
+        # crude inverse-coverage weighting so rare-positive images show up more
+        coverages = []
+        for idx in range(len(train_ds)):
+            _, mask = train_ds[idx]             # mask is float32 [H,W] 0/1
+            coverages.append(mask.mean().item())
+        weights = 1.0 / (np.array(coverages) + 1e-3)
+        sampler = WeightedRandomSampler(weights, num_samples=len(train_ds),
+                                        replacement=True)
+        train_loader = DataLoader(train_ds,
+                                  batch_size=batch_size,
+                                  sampler=sampler,
+                                  num_workers=num_workers,
+                                  pin_memory=pin_memory)
+    else:
+        train_loader = DataLoader(train_ds,
+                                  batch_size=batch_size,
+                                  shuffle=True,
+                                  num_workers=num_workers,
+                                  pin_memory=pin_memory)
+
+    # ------------------------------------------------------------------ #
+    # VAL and TEST loaders
+    # ------------------------------------------------------------------ #
+    val_loader  = DataLoader(valid_ds, batch_size=1, shuffle=False,
+                             num_workers=num_workers, pin_memory=pin_memory)
+    test_loader = DataLoader(test_ds,  batch_size=1, shuffle=False,
+                             num_workers=num_workers, pin_memory=pin_memory)
+
+    return train_loader, val_loader, test_loader

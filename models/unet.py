@@ -52,11 +52,23 @@ class BinarySegmentationLoss(nn.Module):
     Combined loss for binary segmentation.
     Uses BCE + Dice loss for single channel output.
     """
-    def __init__(self, bce_weight=1.0, dice_weight=1.0):
+    def __init__(
+        self,
+        bce_weight: float = 1.0,
+        dice_weight: float = 1.0,
+        pos_weight: float = None
+    ):
         super().__init__()
-        self.bce_weight = bce_weight
+        self.bce_weight  = bce_weight
         self.dice_weight = dice_weight
-        
+
+        # If pos_weight is provided, use it in BCEWithLogitsLoss
+        if pos_weight is not None:
+            pw = torch.tensor([pos_weight], dtype=torch.float)
+            self.bce_fn = nn.BCEWithLogitsLoss(pos_weight=pw)
+        else:
+            self.bce_fn = nn.BCEWithLogitsLoss()
+
     def forward(self, logits, targets):
         """
         Args:
@@ -65,10 +77,10 @@ class BinarySegmentationLoss(nn.Module):
         """
         # Squeeze logits to match target dimensions
         logits = logits.squeeze(1)  # [B, H, W]
-        
-        # BCE Loss
-        bce_loss = F.binary_cross_entropy_with_logits(logits, targets)
-        
+
+        # BCE Loss (with optional pos_weight)
+        bce_loss = self.bce_fn(logits, targets)
+
         # Dice Loss
         probs = torch.sigmoid(logits)
         smooth = 1e-6
@@ -77,12 +89,19 @@ class BinarySegmentationLoss(nn.Module):
             probs.sum() + targets.sum() + smooth
         )
         dice_loss = 1.0 - dice_coeff
-        
+
         return self.bce_weight * bce_loss + self.dice_weight * dice_loss
 
 
-def get_criterion() -> nn.Module:
-    return BinarySegmentationLoss(bce_weight=1.0, dice_weight=1.0)
+def get_criterion(pos_weight: float = None) -> nn.Module:
+    """
+    Returns a BinarySegmentationLoss with optional pos_weight.
+    """
+    return BinarySegmentationLoss(
+        bce_weight=1.0,
+        dice_weight=1.0,
+        pos_weight=pos_weight
+    )
 
 
 def get_optimizer(model: torch.nn.Module, lr: float) -> torch.optim.Optimizer:

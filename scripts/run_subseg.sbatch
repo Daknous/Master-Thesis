@@ -30,10 +30,13 @@ export WANDB_API_KEY=$(< ~/.wandb_api_key)
 python main.py \
      --batch_size 4 \
      --lr 1e-4 \
-     --wandb_tags Test single_channel pixel_iou dice prec_rec \
-     --epochs 10 \
+     --epochs 100 \
      --num_workers 4 \
      --device cuda \
-     --log_dir ~/Master-Thesis/runs/single_channel \
+     --log_dir ~/Master-Thesis/runs/orthL8 \
      --wandb_project substation-segmentation \
-     --wandb_entity seif-daknou-technical-university-of-berlin
+     --wandb_entity seif-daknou-technical-university-of-berlin \
+     --wandb_group orthogonal_L8 \
+     --wandb_tags orthL8,res1200,pw_on \
+     --apply_pos_weight
+

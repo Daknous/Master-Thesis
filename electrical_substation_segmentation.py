@@ -1,5 +1,5 @@
 """
-Single‐script training pipeline for transformer segmentation using PyTorch and Albumentations.
+Single script training pipeline for transformer segmentation using PyTorch and Albumentations.
 Uses a combined BCE + Dice loss and runs a validation loop each epoch to track IoU.
 Usage:
     python electrical_substation_segmentation.py \
@@ -13,6 +13,18 @@ Usage:
         --num_workers 4 \
         [--device cuda] [--dry_run] \
         [--log_dir runs/exp2]
+dry_run:
+    python electrical_substation_segmentation.py \
+        --train_images_dir /Users/zif/Documents/Substation_Master_thesis/Master-Thesis/Dataset_v2_filtered/train \
+        --train_coco_json  /Users/zif/Documents/Substation_Master_thesis/Master-Thesis/Dataset_v2_filtered/train/_annotations.coco.json \
+        --val_images_dir   /Users/zif/Documents/Substation_Master_thesis/Master-Thesis/Dataset_v2_filtered/valid \
+        --val_coco_json    /Users/zif/Documents/Substation_Master_thesis/Master-Thesis/Dataset_v2_filtered/valid/_annotations.coco.json \
+        --batch_size 2 \
+        --dry_run \
+        --one_cycle \
+        --tta_flip \
+        --loss_ft
+
 """
 
 import os
@@ -26,6 +38,7 @@ from collections import defaultdict
 
 import torch
 from torch import nn, optim
+from torch.optim.lr_scheduler import OneCycleLR, ReduceLROnPlateau
 from torch.utils.data import Dataset, DataLoader
 import segmentation_models_pytorch as smp
 import albumentations as A
@@ -34,8 +47,8 @@ import albumentations as A
 # Configuration
 # ---------------------------
 IMG_SIZE = 1200
-ENCODER = 'resnet34'  # or 'efficientnet-b3', 'resnet50', etc.
-PREPROCESS_FN = smp.encoders.get_preprocessing_fn(ENCODER, 'imagenet')
+DEFAULT_ENCODER = 'resnet34'
+PREPROCESS_FN   = smp.encoders.get_preprocessing_fn(DEFAULT_ENCODER, 'imagenet')
 
 # ---------------------------
 # Custom Augmentation Transforms
@@ -226,137 +239,137 @@ class SubstationDataset(Dataset):
 
         return torch.from_numpy(img), torch.from_numpy(mask), filename
 
-
-# ---------------------------
-# Training & Validation Routine
-# ---------------------------
+# ---------------------------------------------------------------------
+# Training + validation
+# ---------------------------------------------------------------------
 def train_model(args):
-    # 1) Device setup
-    device = torch.device('cuda' if torch.cuda.is_available() and args.device == 'cuda' else 'cpu')
-    print(f"Using device: {device}")
+    # 1) Device ---------------------------------------------------------
+    device = torch.device("cuda" if torch.cuda.is_available()
+                          and args.device == "cuda" else "cpu")
+    print("Using device:", device)
 
-    # 2) Build Datasets & DataLoaders
-    train_ds = SubstationDataset(
-        images_dir       = args.train_images_dir,
-        coco_json        = args.train_coco_json,
-        augmentation     = get_training_augmentation(),
-        preprocessing_fn = PREPROCESS_FN
-    )
-    val_ds = SubstationDataset(
-        images_dir       = args.val_images_dir,
-        coco_json        = args.val_coco_json,
-        augmentation     = get_validation_augmentation(),
-        preprocessing_fn = PREPROCESS_FN
-    )
+    # 2) Data -----------------------------------------------------------
+    global PREPROCESS_FN
+    PREPROCESS_FN = smp.encoders.get_preprocessing_fn(args.encoder, "imagenet")
 
-    train_loader = DataLoader(
-        train_ds,
-        batch_size   = args.batch_size,
-        shuffle      = True,
-        num_workers  = args.num_workers,
-        pin_memory   = True
-    )
-    val_loader = DataLoader(
-        val_ds,
-        batch_size   = 1, # Keep validation batch size at 1 for simple IoU calculation
-        shuffle      = False,
-        num_workers  = args.num_workers,
-        pin_memory   = True
-    )
+    train_ds = SubstationDataset(args.train_images_dir, args.train_coco_json,
+                                 augmentation=get_training_augmentation(),
+                                 preprocessing_fn=PREPROCESS_FN)
+    val_ds   = SubstationDataset(args.val_images_dir,   args.val_coco_json,
+                                 augmentation=get_validation_augmentation(),
+                                 preprocessing_fn=PREPROCESS_FN)
 
-    # 3) Model, loss, optimizer
-    model = smp.Unet(
-        encoder_name    = ENCODER,
-        encoder_weights = 'imagenet',
-        in_channels     = 3,
-        classes         = 1  # <-- CHANGED: Standard binary segmentation
-    )
-    model.to(device)
+    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True,
+                              num_workers=args.num_workers, pin_memory=True)
+    val_loader   = DataLoader(val_ds,   batch_size=1,  shuffle=False,
+                              num_workers=args.num_workers, pin_memory=True)
 
-    # Composite loss: BCEWithLogits + Dice
-    bce_loss  = nn.BCEWithLogitsLoss()
-    dice_loss = smp.losses.DiceLoss(mode='binary')
-    optimizer = optim.AdamW(model.parameters(), lr=args.lr) # <-- CHANGED: Using AdamW
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer,
-        mode='max',      # <-- CHANGED: Monitor a metric that should be maximized
-        factor=0.5,      # <-- CHANGED: More aggressive LR reduction
-        patience=5,      # <-- CHANGED: Adjust patience
-        verbose=True
-    )
+    # 3) Model / loss / optim ------------------------------------------
+    model = smp.Unet(encoder_name=args.encoder, encoder_weights="imagenet",
+                     in_channels=3, classes=1).to(device)
 
-    best_val_iou = 0.0
+    if args.loss_ft:
+        loss_fn = smp.losses.TverskyLoss(mode="binary", alpha=0.7, gamma=0.75)
+        print("Loss: Focal-Tversky (α 0.7, γ 0.75)")
+    else:
+        bce  = nn.BCEWithLogitsLoss()
+        dice = smp.losses.DiceLoss(mode="binary")
+        loss_fn = lambda p, t: 0.5 * bce(p, t) + 0.5 * dice(p, t)
+        print("Loss: 0.5 × BCE  +  0.5 × Dice")
+
+    optimizer = optim.AdamW(model.parameters(), lr=args.lr)
+
+    if args.one_cycle:
+        scheduler = OneCycleLR(optimizer, max_lr=args.lr,
+                               epochs=args.epochs,
+                               steps_per_epoch=len(train_loader),
+                               pct_start=0.3, anneal_strategy="cos")
+    else:
+        scheduler = ReduceLROnPlateau(optimizer, mode="max",
+                                      factor=0.5, patience=5, verbose=True)
+
+    best_val_iou   = 0.0
+    stagnant_epochs = 0
     os.makedirs(args.log_dir, exist_ok=True)
 
-    # 4) Dry‐run (optional)
+    # 4) Optional dry-run ----------------------------------------------
     if args.dry_run:
-        imgs, masks, _ = next(iter(train_loader))
+        imgs, masks, *_ = next(iter(train_loader))
         imgs, masks = imgs.to(device), masks.to(device)
         with torch.no_grad():
             preds = model(imgs)
-        print(f"Dry run shapes → imgs: {imgs.shape}, masks: {masks.shape}, preds: {preds.shape}")
+        print(f"Dry-run shapes  imgs:{imgs.shape}  masks:{masks.shape}  preds:{preds.shape}")
         sys.exit(0)
 
-    # 5) Main training loop
+    # 5) Main loop ------------------------------------------------------
     for epoch in range(1, args.epochs + 1):
-        print("-" * 25)
+        print("-" * 30)
+        # ---- Train ----------------------------------------------------
         model.train()
-        total_loss = 0.0
+        running_loss = 0.0
 
-        for imgs, masks, _ in train_loader:
+        for imgs, masks, *_ in train_loader:
             imgs, masks = imgs.to(device), masks.to(device)
-
-            preds = model(imgs)  # [B, 1, H, W]
-            
-            # <-- CHANGED: Weighted loss
-            loss = 0.5 * bce_loss(preds, masks) + 0.5 * dice_loss(preds, masks)
+            preds = model(imgs)
+            loss  = loss_fn(preds, masks)
 
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
 
-            total_loss += loss.item()
+            if args.one_cycle:          # advance One-Cycle LR *per batch*
+                scheduler.step()
 
-        avg_train_loss = total_loss / len(train_loader)
-        print(f"Epoch {epoch}/{args.epochs} → Train Loss: {avg_train_loss:.4f}")
+            running_loss += loss.item()
 
-        # 6) Validation loop (compute IoU at threshold=0.5)
+        avg_train_loss = running_loss / len(train_loader)
+        print(f"Epoch {epoch}/{args.epochs}  |  Train Loss: {avg_train_loss:.4f}")
+
+        # ---- Validate -------------------------------------------------
         model.eval()
-        val_iou_list = []
+        val_iou = []
 
         with torch.no_grad():
-            for imgs, masks, _ in val_loader:
-                imgs, masks = imgs.to(device), masks.to(device) # mask is [1, 1, H, W]
+            for imgs, masks, *_ in val_loader:
+                imgs, masks = imgs.to(device), masks.to(device)
 
-                logits = model(imgs)     # [1, 1, H, W]
-                
-                # <-- CHANGED: Simplified logic for 1-channel output
-                probs  = torch.sigmoid(logits) # Probabilities [1, 1, H, W]
-                pred_bin = (probs > 0.5).float()
-                
-                # IoU calculation
-                intersection = torch.sum(pred_bin * masks)
-                union = torch.sum(pred_bin) + torch.sum(masks) - intersection
-                iou = (intersection + 1e-6) / (union + 1e-6) # Add epsilon for stability
-                
-                val_iou_list.append(iou.item())
+                logits = model(imgs)
+                if args.tta_flip:
+                    logits = (logits + model(torch.flip(imgs, dims=[3]))) / 2
 
-        avg_val_iou = np.mean(val_iou_list)
-        scheduler.step(avg_val_iou)  # Adjust learning rate based on validation IoU
-        
-        print(f"Epoch {epoch}/{args.epochs} → Val IoU: {avg_val_iou:.4f}")
-        current_lr = optimizer.param_groups[0]['lr']
-        print(f"  → Learning rate: {current_lr:.6f}")
+                probs = torch.sigmoid(logits)
+                preds = (probs > 0.5).float()
 
-        # 7) Checkpoint if validation IoU improved
+                inter = (preds * masks).sum()
+                union = preds.sum() + masks.sum() - inter
+                val_iou.append(((inter + 1e-6) / (union + 1e-6)).item())
+
+        avg_val_iou = np.mean(val_iou)
+
+        # LR step for Plateau schedule
+        if not args.one_cycle:
+            scheduler.step(avg_val_iou)
+
+        lr_now = optimizer.param_groups[0]["lr"]
+        print(f"           Val IoU: {avg_val_iou:.4f}  |  LR: {lr_now:.6f}")
+
+        # ---- Checkpoint / early-stop ---------------------------------
         if avg_val_iou > best_val_iou:
             best_val_iou = avg_val_iou
+            stagnant_epochs = 0
             ckpt_name = f"model_best_epoch{epoch}_valIoU{avg_val_iou:.4f}.pth"
-            ckpt_path = os.path.join(args.log_dir, ckpt_name)
-            torch.save(model.state_dict(), ckpt_path)
+            torch.save(model.state_dict(), os.path.join(args.log_dir, ckpt_name))
             print(f"  → New best model saved: {ckpt_name}")
+        else:
+            stagnant_epochs += 1
+            print(f"  → No improvement for {stagnant_epochs} epoch(s)")
+
+        if args.early_stop and stagnant_epochs >= args.early_stop:
+            print(f"Early stopping (patience = {args.early_stop})")
+            break
 
     print(f"\nTraining complete. Best Val IoU: {best_val_iou:.4f}")
+
 
 
 # ---------------------------
@@ -381,10 +394,16 @@ def parse_args():
     p.add_argument('--device',      type=str, default='cuda', choices=['cpu', 'cuda'])
     p.add_argument('--dry_run',     action='store_true', help='Perform a single batch test and exit.')
     p.add_argument('--log_dir',     type=str, default='runs', help='Directory to save best checkpoints.')
+    p.add_argument('--encoder', type=str, default='resnet34', help='SMP backbone, e.g. resnet34, efficientnet-b3…')
+    p.add_argument('--one_cycle', action='store_true', help='Use One-Cycle LR schedule')
+    p.add_argument('--early_stop', type=int, default=0, help='Patience in epochs (0 = off, i.e. disabled)')
+    p.add_argument('--tta_flip', action='store_true', help='Average logits of image and its horizontal flip during validation')
+    p.add_argument('--loss_ft', action='store_true', help='Use Focal-Tversky loss (alpha 0.7, gamma 0.75) instead of BCE+Dice')
 
     return p.parse_args()
 
 
 if __name__ == '__main__':
     args = parse_args()
+    PREPROCESS_FN = smp.encoders.get_preprocessing_fn(args.encoder, 'imagenet')
     train_model(args)

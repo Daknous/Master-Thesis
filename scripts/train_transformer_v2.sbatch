@@ -30,3 +30,5 @@ srun python ~/Master-Thesis/electrical_substation_segmentation.py \
      --num_workers 4 \
      --device cuda \
      --log_dir ~/Master-Thesis/runs/exp5_dataset_v2 \
+     --encoder resnet34 \
+     --one_cycle
