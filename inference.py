@@ -7,10 +7,10 @@ and saves overlay images.
 
 Usage:
     python inference.py \
-        --images_dir /path/to/validation/images \
-        --coco_json /path/to/annotations.json \
-        --checkpoint /path/to/checkpoint.pth \
-        --output_dir /path/to/save/overlays \
+        --images_dir /Users/zif/Documents/Substation_Master_thesis/Master-Thesis/Dataset_v2_filtered/valid \
+        --coco_json /Users/zif/Documents/Substation_Master_thesis/Master-Thesis/Dataset_v2_filtered/valid/_annotations.coco.json \
+        --checkpoint /Users/zif/Documents/Substation_Master_thesis/Master-Thesis/runs/exp5/model_epoch100_valIoU0.6063.pth \
+        --output_dir /Volumes/Seif_SSD/validation_overlays_dataset_v2 \
         [--device cuda] [--normalize_output]
 """
 import os

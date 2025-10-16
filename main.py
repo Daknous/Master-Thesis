@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 """
-Main training script: orchestrates the segmentation pipeline via modular helpers.
+Main training script for binary segmentation (single channel output).
 """
 import os
 import sys
@@ -14,13 +14,14 @@ from torch.optim.lr_scheduler import OneCycleLR
 import wandb
 from helper.dataset_loader import get_dataloaders
 from models.unet import get_model, get_criterion, get_optimizer
-from utils.metrics import iou_score
-from utils.logger import init_wandb, log_metrics, log_image
-from settings.config import METRIC_THRESHOLD
+from utils.metrics import iou_score, dice_coefficient, pixel_accuracy
+from utils.logger import init_wandb, log_metrics
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Train segmentation model using config paths and helper modules.")
+    parser = argparse.ArgumentParser(description="Train binary segmentation model.")
+    # General settings
+    parser.add_argument('--seed',         type=int,   default=42,    help='Random seed for reproducibility')
     # Training hyperparameters
     parser.add_argument('--batch_size',  type=int,   default=8,     help='Mini-batch size')
     parser.add_argument('--lr',          type=float, default=1e-4,  help='Initial learning rate')
@@ -31,17 +32,41 @@ def parse_args():
     parser.add_argument('--device',      type=str,   default='auto', choices=['auto','cpu','cuda'], help='Compute device')
     parser.add_argument('--dry_run',     action='store_true',        help='Perform a single batch test and exit')
     parser.add_argument('--log_dir',     type=str,   default='runs',  help='Directory to save experiment outputs')
+    # W&B configuration
     parser.add_argument('--wandb_project', type=str, default='substation-segmentation', help='W&B project name')
     parser.add_argument('--wandb_entity',  type=str, default=None,   help='W&B entity/team name')
-    parser.add_argument('--seed',         type=int,   default=42,    help='Random seed for reproducibility')
-    # W&B tags
-    parser.add_argument('--tags',        nargs='+', default=[],    help='List of W&B tags for this run')
-    return parser.parse_args()
+    parser.add_argument('--wandb_tags',    nargs='+', default=[],    help='List of W&B tags for this run')
+    parser.add_argument('--wandb_group',   type=str, default=None,  help='W&B group name for grouping runs')
+    # Resume from checkpoint
+    parser.add_argument('--resume',       type=str, default=None,   help='Path to checkpoint .pth to resume from')
+    # ** New: apply pos_weight flag **
+    parser.add_argument('--apply_pos_weight', action='store_true', help='Reweight BCE loss for class imbalance')
+    # img_size so we can switch 1024 / 1200 easily
+    parser.add_argument('--img_size', type=int, default=1200,
+                        help='Square image size (both H and W)')
+    # metric_threshold (used in evaluate_model & logs)
+    parser.add_argument('--metric_threshold', type=float, default=0.4,
+                        help='Probability thresh-hold for IoU/Dice at eval time')
+    # sampler flag that toggles class-balanced sampling
+    parser.add_argument('--use_sampler_weights', action='store_true',
+                        help='Enable WeightedRandomSampler to up-weight rare positives')
 
+# ─── NEW EXPERIMENT FLAGS ───────────────────────────────────────────
+    parser.add_argument('--decoder_attention', type=str, default='none',
+                        choices=['none','scse'],
+                        help='Attention block injected in UNet decoder')
+    parser.add_argument('--loss', type=str, default='bce_dice',
+                        choices=['bce_dice','focal_tversky'],
+                        help='Loss function')
+    parser.add_argument('--tta_vflip', action='store_true',
+                        help='Use vertical-flip TTA during evaluation')
+
+    return parser.parse_args()
 
 def main():
     args = parse_args()
 
+    metric_threshold = args.metric_threshold
     # Set random seeds for deterministic behavior
     random.seed(args.seed)
     np.random.seed(args.seed)
@@ -51,22 +76,26 @@ def main():
     torch.backends.cudnn.benchmark     = False
 
     # Device setup
-    device = torch.device('cuda' if args.device=='auto' and torch.cuda.is_available() else args.device)
+    if args.device == "auto":
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    else:
+        device = torch.device(args.device)
     print(f"Using device: {device}")
     print(f"Dropout probability: {args.dropout}")
 
-    # Initialize W&B with tags
-    run_name = f"exp.{int(time.time())}"
+    # Initialize W&B
+    run_name = f"binary_exp_{int(time.time())}"
     init_wandb(
         project_name=args.wandb_project,
         config=vars(args),
         entity=args.wandb_entity,
         run_name=run_name,
-        tags=args.tags
+        tags=args.wandb_tags + ['binary_segmentation'],
+        group=args.wandb_group
     )
 
     # Experiment directory under runs/
-    exp_name = wandb.run.name
+    exp_name      = wandb.run.name
     experiment_dir = os.path.join(args.log_dir, exp_name)
     os.makedirs(experiment_dir, exist_ok=True)
     print(f"Saving checkpoints to: {experiment_dir}")
@@ -75,12 +104,36 @@ def main():
     train_loader, val_loader, _ = get_dataloaders(
         batch_size=args.batch_size,
         num_workers=args.num_workers,
-        pin_memory=True
+        pin_memory=True,
+        img_size=args.img_size,
+        use_sampler_weights=args.use_sampler_weights
     )
 
-    # Model, criterion, optimizer, scheduler
-    model     = get_model(device, dropout=args.dropout)
-    criterion = get_criterion()
+    # Model
+    model = get_model(device, dropout=args.dropout, decoder_attention=args.decoder_attention)
+
+    # ---------- loss / pos-weight ------------------------------------------------
+    if args.apply_pos_weight:
+        mean_cov   = compute_mean_coverage(train_loader)          # e.g. 2 × 10⁻⁴
+        pos_weight = (1.0 - mean_cov) / mean_cov                 # inverse prevalence
+
+        # ---- cap the value ------------------------------------------------------
+        MIN_W, MAX_W = 1.0, 5_000.0                               # tweak as desired
+        pos_weight   = float(np.clip(pos_weight, MIN_W, MAX_W))
+
+        print(f"mean_cov = {mean_cov:.6f}  →  pos_weight = {pos_weight:.1f}")
+        wandb.config.update({'mean_cov': mean_cov,
+                            'pos_weight': pos_weight})           # track in W&B
+
+        criterion = get_criterion(loss_name=args.loss,
+                                pos_weight=pos_weight)
+    else:
+        criterion = get_criterion(loss_name=args.loss)
+    
+    criterion = criterion.to(device)
+
+
+    # Optimizer & Scheduler
     optimizer = get_optimizer(model, lr=args.lr)
     scheduler = OneCycleLR(
         optimizer,
@@ -92,26 +145,43 @@ def main():
         div_factor=25.0
     )
 
+    # Resume support (unchanged from before)
+    start_epoch  = 1
     best_val_iou = 0.0
+    if args.resume:
+        print(f"Loading checkpoint from {args.resume} …")
+        ckpt = torch.load(args.resume, map_location=device)
+        model.load_state_dict(ckpt['model_state_dict'])
+        optimizer.load_state_dict(ckpt['optimizer_state_dict'])
+        if 'scheduler_state_dict' in ckpt:
+            scheduler.load_state_dict(ckpt['scheduler_state_dict'])
+        best_val_iou = ckpt.get('best_val_iou', best_val_iou)
+        start_epoch  = ckpt['epoch'] + 1
+        print(f"Resumed: starting at epoch {start_epoch}, best_val_iou={best_val_iou:.4f}")
 
-    # Dry-run check
+    # Dry-run check (unchanged)
     if args.dry_run:
         imgs, masks = next(iter(train_loader))
         imgs, masks = imgs.to(device), masks.to(device)
-        with torch.no_grad(): preds = model(imgs)
-        print(f"Dry run shapes → imgs: {imgs.shape}, masks: {masks.shape}, preds: {preds.shape}")
+        print(f"Input shapes → imgs: {imgs.shape}, masks: {masks.shape}")
+        print(f"Mask stats → min: {masks.min():.3f}, max: {masks.max():.3f}, mean: {masks.mean():.3f}")
+        print(f"Positive pixels: {(masks > 0.5).sum().item()} / {masks.numel()}")
+        with torch.no_grad():
+            preds = model(imgs)
+            print(f"Model output shape: {preds.shape}")
+            print(f"Output range: {preds.min():.3f} to {preds.max():.3f}")
         sys.exit(0)
 
     # Training loop
-    for epoch in range(1, args.epochs + 1):
+    for epoch in range(start_epoch, args.epochs + 1):
         print(f"--- Training Epoch {epoch:>3} ---")
         model.train()
         total_loss = 0.0
 
         for imgs, masks in train_loader:
             imgs, masks = imgs.to(device), masks.to(device)
-            logits = model(imgs)
-            loss   = criterion(logits, masks)
+            logits = model(imgs)                  # [B, 1, H, W]
+            loss   = criterion(logits, masks)     # masks: [B, H, W]
 
             optimizer.zero_grad()
             loss.backward()
@@ -121,87 +191,126 @@ def main():
 
         avg_train_loss = total_loss / len(train_loader)
 
-        # End-of-epoch Train IoU
+        # End-of-epoch evaluation
         model.eval()
-        train_iou_accum = 0.0
-        with torch.no_grad():
-            for imgs, masks in train_loader:
-                imgs, masks = imgs.to(device), masks.to(device)
-                logits = model(imgs)
-                probs  = torch.softmax(logits, dim=1)[:,1] if logits.shape[1]>1 else torch.sigmoid(logits[:,0])
-                targets= masks[:,1] if masks.ndim==4 else masks
-                train_iou_accum += iou_score(probs, targets, threshold=METRIC_THRESHOLD)
-        avg_train_iou = train_iou_accum / len(train_loader)
+        train_metrics = evaluate_model(model, train_loader, device, metric_threshold, criterion, tta_vflip = args.tta_vflip)
+        val_metrics   = evaluate_model(model, val_loader,   device, metric_threshold, criterion, tta_vflip = args.tta_vflip)
         current_lr    = scheduler.get_last_lr()[0]
-        print(f"Epoch {epoch} → Train Loss: {avg_train_loss:.4f} | Train IoU: {avg_train_iou:.4f} | LR: {current_lr:.6f}")
 
-        # Validation
-        val_loss = 0.0
-        val_iou  = 0.0
-        with torch.no_grad():
-            for imgs, masks in val_loader:
-                imgs, masks = imgs.to(device), masks.to(device)
-                logits = model(imgs)
-                val_loss += criterion(logits, masks).item()
-                preds     = torch.softmax(logits, dim=1)[:,1] if logits.shape[1]>1 else torch.sigmoid(logits[:,0])
-                truths    = masks[:,1] if masks.ndim==4 else masks
-                val_iou  += iou_score(preds, truths, threshold=METRIC_THRESHOLD)
-
-        avg_val_loss = val_loss / len(val_loader)
-        avg_val_iou  = val_iou  / len(val_loader)
-        print(f"Epoch {epoch} → Val Loss: {avg_val_loss:.4f} | Val IoU: {avg_val_iou:.4f}")
-
-        # Log metrics
-        log_metrics(
-            {
-                'train/loss': avg_train_loss,
-                'train/iou':  avg_train_iou,
-                'val/loss':   avg_val_loss,
-                'val/iou':    avg_val_iou
-            },
-            step=epoch
+        print(
+            f"Epoch {epoch} → Train Loss: {avg_train_loss:.4f} | "
+            f"Train IoU: {train_metrics['iou']:.4f} | LR: {current_lr:.6f}"
+        )
+        print(
+            f"Epoch {epoch} → Val Loss: {val_metrics['loss']:.4f} | "
+            f"Val IoU: {val_metrics['iou']:.4f} | Val Dice: {val_metrics['dice']:.4f}"
         )
 
-        # Visual logging of validation examples (only after 10 epochs)
-        if epoch > 10:
-            imgs_vis, masks_vis = next(iter(val_loader))
-            imgs_vis, masks_vis = imgs_vis.to(device), masks_vis.to(device)
-            with torch.no_grad():
-                logits_vis = model(imgs_vis)
-                preds_vis  = torch.softmax(logits_vis, dim=1)[:,1] if logits_vis.shape[1]>1 else torch.sigmoid(logits_vis[:,0])
-            truths_vis = masks_vis[:,1] if masks_vis.ndim==4 else masks_vis
-            for idx in range(min(3, imgs_vis.size(0))):
-                # Log original image, ground truth, and prediction mask
-                overlay = torch.stack([
-                    imgs_vis[idx].cpu(),
-                    truths_vis[idx].unsqueeze(0).cpu(),
-                    (preds_vis[idx] > METRIC_THRESHOLD).float().unsqueeze(0).cpu()
-                ], dim=0)
-                log_image(
-                    image=overlay,
-                    caption=f"GT vs Pred (idx={idx})",
-                    step=epoch,
-                    key=f"example_{idx}"
-                )
+        # Log metrics
+        log_metrics({
+            'train/loss':    avg_train_loss,
+            'train/iou':     train_metrics['iou'],
+            'train/dice':    train_metrics['dice'],
+            'train/pixel_acc': train_metrics['pixel_acc'],
+            'val/loss':      val_metrics['loss'],
+            'val/iou':       val_metrics['iou'],
+            'val/dice':      val_metrics['dice'],
+            'val/pixel_acc': val_metrics['pixel_acc'],
+            'lr':            current_lr
+        }, step=epoch)
+
+        # Visual logging of validation examples
+        if epoch % 5 == 0:
+            log_predictions(model, val_loader, device, epoch, metric_threshold)
 
         # Checkpoint best model
-        if avg_val_iou > best_val_iou:
-            best_val_iou = avg_val_iou
-            ckpt_name    = f"best_model_epoch{epoch}.pth"
-            ckpt_path    = os.path.join(experiment_dir, ckpt_name)
-            torch.save(
-                {
-                    'epoch': epoch,
-                    'model_state_dict': model.state_dict(),
-                    'optimizer_state_dict': optimizer.state_dict(),
-                    'best_val_iou': best_val_iou
-                },
-                ckpt_path
-            )
-            print(f"Saved new best model: {ckpt_name} to {experiment_dir}")
+        if val_metrics['iou'] > best_val_iou:
+            best_val_iou = val_metrics['iou']
+            ckpt_name = f"best_model_epoch{epoch}.pth"
+            ckpt_path = os.path.join(experiment_dir, ckpt_name)
+            torch.save({
+                'epoch': epoch,
+                'model_state_dict':       model.state_dict(),
+                'optimizer_state_dict':   optimizer.state_dict(),
+                'scheduler_state_dict':   scheduler.state_dict(),
+                'best_val_iou':           best_val_iou,
+                'config':                 vars(args)
+            }, ckpt_path)
+            print(f"Saved new best model: {ckpt_name} (IoU: {best_val_iou:.4f})")
 
     print(f"Training complete. Best Val IoU: {best_val_iou:.4f}")
 
+
+def compute_mean_coverage(loader):
+    total_pix = 0
+    total_fg  = 0
+    for _, masks in loader:
+        total_pix += masks.numel()
+        total_fg  += (masks > 0).sum().item()
+    return total_fg / total_pix
+
+def evaluate_model(model, dataloader, device, threshold, criterion, tta_vflip):
+    """Evaluate model on given dataloader."""
+    model.eval()
+    total_loss = total_iou = total_dice = total_pixel_acc = 0.0
+    with torch.no_grad():
+        for imgs, masks in dataloader:
+            imgs, masks = imgs.to(device), masks.to(device)
+            logits = model(imgs)                      # [B, 1, H, W]
+
+            # ─── optional vertical-flip TTA ─────────────────────────────
+            if tta_vflip:
+                logits_v = torch.flip(model(torch.flip(imgs, dims=[2])), dims=[2])
+                logits   = 0.5 * (logits + logits_v)
+
+            # Loss with the *passed-in* criterion
+            loss = criterion(logits, masks)
+            total_loss += loss.item()
+
+            probs = torch.sigmoid(logits.squeeze(1))  # [B, H, W]
+
+            total_iou       += iou_score(probs, masks, threshold)
+            total_dice      += dice_coefficient(probs, masks, threshold)
+            total_pixel_acc += pixel_accuracy(probs, masks, threshold)
+
+    num_batches = len(dataloader)
+    return {
+        "loss":      total_loss / num_batches,
+        "iou":       total_iou   / num_batches,
+        "dice":      total_dice  / num_batches,
+        "pixel_acc": total_pixel_acc / num_batches,
+    }
+
+def log_predictions(model, dataloader, device, epoch, threshold, num_examples=3):
+    """Log prediction examples to wandb (Input | GT | Pred)."""
+    model.eval()
+    imgs, masks = next(iter(dataloader))
+    imgs, masks = imgs.to(device), masks.to(device)
+
+    with torch.no_grad():
+        logits = model(imgs)                          # [B,1,H,W]
+        probs  = torch.sigmoid(logits.squeeze(1))     # [B,H,W]
+        preds  = (probs > threshold).float()          # [B,H,W]
+
+    for idx in range(min(num_examples, imgs.size(0))):
+        # 1) Convert to CPU numpy
+        img_np  = imgs[idx].cpu().numpy().transpose(1,2,0)  # [H,W,3], floats
+        gt_np   = masks[idx].cpu().numpy()                  # [H,W], floats 0/1
+        pred_np = preds[idx].cpu().numpy()                  # [H,W], floats 0/1
+
+        img_disp = (img_np - img_np.min()) / (img_np.max() - img_np.min() + 1e-8)
+
+        gt_disp   = (gt_np   * 255).astype(np.uint8)
+        pred_disp = (pred_np * 255).astype(np.uint8)
+
+        key = f"predictions/epoch_{epoch:03d}/example_{idx}"
+        wandb.log({
+            key: [
+                wandb.Image(img_disp,   caption="Input"),
+                wandb.Image(gt_disp,    caption="Ground Truth Mask"),
+                wandb.Image(pred_disp,  caption="Predicted Mask"),
+            ]
+        }, step=epoch)
 
 if __name__ == '__main__':
     main()

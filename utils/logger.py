@@ -6,7 +6,8 @@ def init_wandb(
     config: dict,
     run_name: str = None,
     entity: str = None,
-    tags: list[str] = None
+    tags: list[str] = None,
+    group: str = None,
 ) -> None:
     """
     Initializes a Weights & Biases run with optional tags.
@@ -24,6 +25,7 @@ def init_wandb(
         name=run_name,
         entity=entity,
         tags=tags,
+        group=group,
         reinit=True
     )
 

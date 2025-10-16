@@ -1,5 +1,5 @@
 """
-Single‐script training pipeline for transformer segmentation using PyTorch and Albumentations.
+Single script training pipeline for transformer segmentation using PyTorch and Albumentations.
 Uses a combined BCE + Dice loss and runs a validation loop each epoch to track IoU.
 Usage:
     python electrical_substation_segmentation.py \
@@ -13,6 +13,22 @@ Usage:
         --num_workers 4 \
         [--device cuda] [--dry_run] \
         [--log_dir runs/exp2]
+dry_run:
+    python electrical_substation_segmentation.py \
+        --train_images_dir /Users/zif/Documents/Substation_Master_thesis/Master-Thesis/Dataset_v2_filtered/train \
+        --train_coco_json  /Users/zif/Documents/Substation_Master_thesis/Master-Thesis/Dataset_v2_filtered/train/_annotations.coco.json \
+        --val_images_dir   /Users/zif/Documents/Substation_Master_thesis/Master-Thesis/Dataset_v2_filtered/valid \
+        --val_coco_json    /Users/zif/Documents/Substation_Master_thesis/Master-Thesis/Dataset_v2_filtered/valid/_annotations.coco.json \
+        --batch_size 4 \
+        --lr 1e-4 \
+        --epochs 100 \
+        --encoder resnet50 \
+        --one_cycle \
+        --post_process \
+        --min_size 50 \
+        --merge_distance 15 \
+        --log_dir runs/exp1_baseline_postproc
+
 """
 
 import os
@@ -21,21 +37,27 @@ import argparse
 import sys
 import cv2
 import numpy as np
+from glob import glob
+from collections import defaultdict
+
 import torch
 from torch import nn, optim
+from torch.optim.lr_scheduler import OneCycleLR, ReduceLROnPlateau
 from torch.utils.data import Dataset, DataLoader
 import segmentation_models_pytorch as smp
 import albumentations as A
-from glob import glob
-from collections import defaultdict
+
+# --- Additional imports for new features ---
+from scipy import ndimage
+import torch.nn.functional as F
 
 # ---------------------------
 # Configuration
 # ---------------------------
-IMG_SIZE = 640
-ENCODER = 'resnet34'  # or 'efficientnet-b3', 'resnet50', etc.
-PREPROCESS_FN = smp.encoders.get_preprocessing_fn(ENCODER, 'imagenet')
-#os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+IMG_SIZE = 1200
+DEFAULT_ENCODER = 'resnet34'
+PREPROCESS_FN   = smp.encoders.get_preprocessing_fn(DEFAULT_ENCODER, 'imagenet')
+
 # ---------------------------
 # Custom Augmentation Transforms
 # ---------------------------
@@ -129,24 +151,22 @@ def get_training_augmentation():
         # geometric
         A.Rotate(limit=360, p=0.5),
         A.HorizontalFlip(p=0.5),
-        # mild affine
-        # A.Affine(rotate=(-15,15), scale=(0.95,1.05), translate_percent=(0.05,0.05), p=0.8),
-        A.PadIfNeeded(min_height=IMG_SIZE, min_width=IMG_SIZE, border_mode=cv2.BORDER_REFLECT),
+        # A.PadIfNeeded(min_height=IMG_SIZE, min_width=IMG_SIZE, border_mode=cv2.BORDER_REFLECT),
         # final mask-aware crop
-        RandomCropWithMask(height=IMG_SIZE, width=IMG_SIZE, min_mask_frac=0.005, max_tries=5, p=1.0),
+        # RandomCropWithMask(height=IMG_SIZE, width=IMG_SIZE, min_mask_frac=0.005, max_tries=5, p=1.0),
         # photometric
-        A.RandomBrightnessContrast(brightness_limit=0.1, contrast_limit=0.1, p=0.3),
-        A.GaussianBlur(blur_limit=7, p=0.2),
-        A.GaussNoise(p=0.2),
+        A.RandomBrightnessContrast(brightness_limit=0.2, contrast_limit=0.2, p=0.4), # Increased intensity
+        # A.GaussianBlur(blur_limit=7, p=0.2),
+        # A.GaussNoise(p=0.2),
         # mask-safe dropout
-        MaskAwareDropout(max_holes=8, hole_frac=0.05, max_mask_overlap_frac=0.1, max_tries=10, p=0.3),
+        # MaskAwareDropout(max_holes=8, hole_frac=0.05, max_mask_overlap_frac=0.1, max_tries=10, p=0.3),
     ], additional_targets={'mask': 'mask'})
 
 
 def get_validation_augmentation():
     return A.Compose([
-        A.PadIfNeeded(min_height=IMG_SIZE, min_width=IMG_SIZE, border_mode=cv2.BORDER_REFLECT, p=1),
-        A.CenterCrop(height=IMG_SIZE, width=IMG_SIZE, p=1),
+        # A.PadIfNeeded(min_height=IMG_SIZE, min_width=IMG_SIZE, border_mode=cv2.BORDER_REFLECT, p=1),
+        # A.CenterCrop(height=IMG_SIZE, width=IMG_SIZE, p=1),
     ], additional_targets={'mask': 'mask'})
 
 
@@ -160,22 +180,6 @@ class SubstationDataset(Dataset):
       - images_dir: folder containing RGB images (*.png, *.jpg)
       - coco_json: path to COCO-format JSON listing only images/annotations for this split
     Returns (image_tensor, mask_tensor, filename).
-    """
-
-import os
-import json
-import cv2
-import numpy as np
-from glob import glob
-from collections import defaultdict
-import torch
-from torch.utils.data import Dataset
-
-class SubstationDataset(Dataset):
-    """
-    Expects:
-      - images_dir: folder with only .png images that have transformer polygon masks
-      - coco_json: COCO file containing only those images & their transformer annotations
     """
     def __init__(self, images_dir, coco_json, augmentation=None, preprocessing_fn=None):
         # 1) Grab all filtered PNGs
@@ -227,11 +231,6 @@ class SubstationDataset(Dataset):
                 pts = np.array(poly, dtype=np.int32).reshape(-1, 2)
                 cv2.fillPoly(mask, [pts], 1)
 
-        # Expand to two channels [background, transformer]
-        mask = mask.astype('float32')
-        bg   = 1.0 - mask
-        mask = np.stack([bg, mask], axis=-1)
-
         # --- Apply augmentation ---
         if self.augmentation:
             data = self.augmentation(image=img, mask=mask)
@@ -243,164 +242,319 @@ class SubstationDataset(Dataset):
 
         # --- To tensor CHW ---
         img  = img.astype('float32').transpose(2, 0, 1)
-        mask = mask.astype('float32').transpose(2, 0, 1)
+        # Add channel dimension for the mask -> [1, H, W] # <-- CHANGED
+        mask = mask.astype('float32')[np.newaxis, :, :]
 
         return torch.from_numpy(img), torch.from_numpy(mask), filename
 
+# ---------------------------------------------------------------------
+# Training + validation
+# ---------------------------------------------------------------------
+class FocalLoss(nn.Module):
+    def __init__(self, alpha=0.25, gamma=2.0):
+        super().__init__()
+        self.alpha = alpha
+        self.gamma = gamma
+        
+    def forward(self, logits, targets):
+        # Flatten the tensors
+        logits = logits.view(-1)
+        targets = targets.view(-1)
+        
+        bce_loss = nn.functional.binary_cross_entropy_with_logits(
+            logits, targets, reduction='none'
+        )
+        
+        probs = torch.sigmoid(logits)
+        pt = torch.where(targets == 1, probs, 1 - probs)
+        focal_weight = (1 - pt).pow(self.gamma)
+        
+        # Apply alpha weighting
+        alpha_t = torch.where(targets == 1, self.alpha, 1 - self.alpha)
+        
+        focal_loss = alpha_t * focal_weight * bce_loss
+        
+        return focal_loss.mean()
 
-# ---------------------------
-# Training & Validation Routine
-# ---------------------------
+# --- Boundary-aware loss ---
+class BoundaryLoss(nn.Module):
+    def __init__(self, theta=5):
+        super().__init__()
+        self.theta = theta
+        self.lap = torch.tensor([[-1,-1,-1],[-1,8,-1],[-1,-1,-1]], dtype=torch.float32).view(1,1,3,3)
+    def forward(self, pred, mask):
+        device = pred.device
+        lap = self.lap.to(device)
+        pred_prob = torch.sigmoid(pred)
+        boundary_targets = F.conv2d(mask, lap, padding=1)
+        boundary_targets = (boundary_targets > 0.1).float()
+        pred_b = F.conv2d(pred_prob, lap, padding=1)
+        boundary_loss = F.binary_cross_entropy_with_logits(
+            pred_b * self.theta, boundary_targets, reduction='none')
+        return boundary_loss.mean()
+    
+def multi_scale_tta(model, imgs, device, scales=[0.8, 1.0, 1.2]):
+    """Multi-scale + flip TTA"""
+    all_preds = []
+    
+    for scale in scales:
+        # Resize image
+        h, w = imgs.shape[2:4]
+        new_h, new_w = int(h * scale), int(w * scale)
+        
+        if scale != 1.0:
+            scaled_imgs = torch.nn.functional.interpolate(
+                imgs, size=(new_h, new_w), mode='bilinear', align_corners=False
+            )
+        else:
+            scaled_imgs = imgs
+        
+        # Original
+        pred = model(scaled_imgs)
+        pred = torch.nn.functional.interpolate(
+            pred, size=(h, w), mode='bilinear', align_corners=False
+        )
+        all_preds.append(pred)
+        
+        # H-flip
+        pred_hflip = model(torch.flip(scaled_imgs, dims=[3]))
+        pred_hflip = torch.flip(pred_hflip, dims=[3])
+        pred_hflip = torch.nn.functional.interpolate(
+            pred_hflip, size=(h, w), mode='bilinear', align_corners=False
+        )
+        all_preds.append(pred_hflip)
+        
+        # V-flip
+        pred_vflip = model(torch.flip(scaled_imgs, dims=[2]))
+        pred_vflip = torch.flip(pred_vflip, dims=[2])
+        pred_vflip = torch.nn.functional.interpolate(
+            pred_vflip, size=(h, w), mode='bilinear', align_corners=False
+        )
+        all_preds.append(pred_vflip)
+    
+    return torch.stack(all_preds).mean(dim=0)
+
+# --- Adaptive threshold selection ---
+def find_optimal_threshold(probs, mask, thresholds=np.arange(0.3, 0.8, 0.05)):
+    best_iou = 0
+    best_t = 0.5
+    for t in thresholds:
+        pred = (probs > t).float()
+        inter = (pred * mask).sum()
+        union = pred.sum() + mask.sum() - inter
+        iou = (inter + 1e-6) / (union + 1e-6)
+        if iou > best_iou:
+            best_iou = iou
+            best_t = t
+    return best_t
+
+# --- Post-processing: connected component filtering ---
+def post_process_predictions(pred_mask, min_size=100, merge_distance=20):
+    mask = pred_mask.astype(np.uint8)
+    # Remove small components
+    labeled, num = ndimage.label(mask)
+    sizes = ndimage.sum(mask, labeled, range(num + 1))
+    mask_clean = np.zeros_like(mask)
+    for i in range(1, num + 1):
+        if sizes[i] >= min_size:
+            mask_clean[labeled == i] = 1
+    # Morphological closing to merge nearby components
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (merge_distance, merge_distance))
+    mask_merged = cv2.morphologyEx(mask_clean, cv2.MORPH_CLOSE, kernel)
+    return mask_merged
+
 def train_model(args):
-    # 1) Device setup
-    if args.device == 'auto':
-        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    # 1) Device ---------------------------------------------------------
+    device = torch.device("cuda" if torch.cuda.is_available()
+                          and args.device == "cuda" else "cpu")
+    print("Using device:", device)
+
+    # 2) Data -----------------------------------------------------------
+    global PREPROCESS_FN
+    PREPROCESS_FN = smp.encoders.get_preprocessing_fn(args.encoder, "imagenet")
+
+    train_ds = SubstationDataset(args.train_images_dir, args.train_coco_json,
+                                 augmentation=get_training_augmentation(),
+                                 preprocessing_fn=PREPROCESS_FN)
+    val_ds   = SubstationDataset(args.val_images_dir,   args.val_coco_json,
+                                 augmentation=get_validation_augmentation(),
+                                 preprocessing_fn=PREPROCESS_FN)
+
+    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True,
+                              num_workers=args.num_workers, pin_memory=True)
+    val_loader   = DataLoader(val_ds,   batch_size=1,  shuffle=False,
+                              num_workers=args.num_workers, pin_memory=True)
+
+    # 3) Model / loss / optim ------------------------------------------
+    # Model with optional attention
+    decoder_attention = args.decoder_attention if hasattr(args, 'decoder_attention') else None
+    model = smp.Unet(encoder_name=args.encoder, encoder_weights="imagenet",
+                     in_channels=3, classes=1,
+                     decoder_attention_type=decoder_attention).to(device)
+
+    # Loss selection
+    if args.use_focal:
+        loss_fn = FocalLoss(alpha=0.25, gamma=2.0)
+        print("Loss: Focal Loss (α=0.25, γ=2.0)")
+    elif args.loss_ft:
+        loss_fn = smp.losses.TverskyLoss(mode="binary", alpha=0.7, gamma=0.75)
+        print("Loss: Focal-Tversky (α 0.7, γ 0.75)")
     else:
-        device = torch.device(args.device)
-    print(f"Using device: {device}")
+        bce  = nn.BCEWithLogitsLoss()
+        dice = smp.losses.DiceLoss(mode="binary")
+        loss_fn = lambda p, t: 0.5 * bce(p, t) + 0.5 * dice(p, t)
+        print("Loss: 0.5 × BCE  +  0.5 × Dice")
+    
+    bnd_loss = BoundaryLoss() if args.use_boundary else None
 
-    # 2) Build Datasets & DataLoaders
-    train_ds = SubstationDataset(
-        images_dir       = args.train_images_dir,
-        coco_json        = args.train_coco_json,
-        augmentation     = get_training_augmentation(),
-        preprocessing_fn = PREPROCESS_FN
-    )
-    val_ds = SubstationDataset(
-        images_dir       = args.val_images_dir,
-        coco_json        = args.val_coco_json,
-        augmentation     = get_validation_augmentation(), #false
-        preprocessing_fn = PREPROCESS_FN
-    )
 
-    train_loader = DataLoader(
-        train_ds,
-        batch_size   = args.batch_size,
-        shuffle      = True,
-        num_workers  = args.num_workers,
-        pin_memory   = True
-    )
-    val_loader = DataLoader(
-        val_ds,
-        batch_size   = 1,
-        shuffle      = False,
-        num_workers  = args.num_workers,
-        pin_memory   = True
-    )
 
-    # 3) Model, loss, optimizer
-    model = smp.Unet(
-        encoder_name    = ENCODER,
-        encoder_weights = 'imagenet',
-        in_channels     = 3,
-        classes         = 2
-    )
-    model.to(device)
+    optimizer = optim.AdamW(model.parameters(), lr=args.lr)
 
-    # Composite loss: BCEWithLogits + Dice
-    bce_loss  = nn.BCEWithLogitsLoss()
-    dice_loss = smp.losses.DiceLoss(mode='binary')
-    optimizer = optim.Adam(model.parameters(), lr=args.lr)
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode='min', factor=0.7, patience=10, verbose=True
-    )
+    if args.one_cycle:
+        scheduler = OneCycleLR(optimizer, max_lr=args.lr,
+                               epochs=args.epochs,
+                               steps_per_epoch=len(train_loader),
+                               pct_start=0.3, anneal_strategy="cos")
+    else:
+        scheduler = ReduceLROnPlateau(optimizer, mode="max",
+                                      factor=0.5, patience=5, verbose=True)
 
-    best_val_iou = 0.0
+    best_val_iou   = 0.0
+    stagnant_epochs = 0
+    os.makedirs(args.log_dir, exist_ok=True)
 
-    # 4) Dry‐run (optional)
+    # 4) Optional dry-run ----------------------------------------------
     if args.dry_run:
-        imgs, masks, _ = next(iter(train_loader))
+        imgs, masks, *_ = next(iter(train_loader))
         imgs, masks = imgs.to(device), masks.to(device)
         with torch.no_grad():
             preds = model(imgs)
-        print(f"Dry run shapes → imgs: {imgs.shape}, masks: {masks.shape}, preds: {preds.shape}")
+        print(f"Dry-run shapes  imgs:{imgs.shape}  masks:{masks.shape}  preds:{preds.shape}")
         sys.exit(0)
 
-    # 5) Main training loop
+    # 5) Main loop ------------------------------------------------------
     for epoch in range(1, args.epochs + 1):
-        print("-------------------------------")
+        print("-" * 30)
+        # ---- Train ----------------------------------------------------
         model.train()
-        total_loss = 0.0
-        count = 0
+        running_loss = 0.0
 
-        for imgs, masks, _ in train_loader:
-            imgs, masks = imgs.to(device), masks.to(device)
+    for imgs, masks, *_ in train_loader:
+        imgs, masks = imgs.to(device), masks.to(device)
+        preds = model(imgs)
+        
+        # Apply hard mining if enabled
+        if args.hard_mining and epoch > 10:
+            with torch.no_grad():
+                probs = torch.sigmoid(preds)
+                errors = torch.abs(probs - masks)
+                threshold = torch.quantile(errors.view(-1), 0.5)
+                hard_mask = errors > threshold
+            
+            # Compute loss only on hard pixels
+            loss = loss_fn(preds[hard_mask], masks[hard_mask])
+        else:
+            # Normal loss computation
+            loss = loss_fn(preds, masks)
+        
+        # Add boundary loss if enabled
+        if bnd_loss is not None:
+            loss += 0.1 * bnd_loss(preds, masks)
+        
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+        
+        if args.one_cycle:
+            scheduler.step()
+        
+        running_loss += loss.item()
 
-            preds = model(imgs)  # [B,2,512,512]
-            loss = bce_loss(preds, masks) + dice_loss(preds, masks)
+        avg_train_loss = running_loss / len(train_loader)
+        print(f"Epoch {epoch}/{args.epochs}  |  Train Loss: {avg_train_loss:.4f}")
 
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-
-            total_loss += loss.item()
-            count += 1
-
-        avg_train_loss = total_loss / count
-        print(f"Epoch {epoch}/{args.epochs} → Train Loss: {avg_train_loss:.4f}")
-
-        # 6) Validation loop (compute IoU at threshold=0.5)
+        # ---- Validate -------------------------------------------------
         model.eval()
-        val_iou = 0.0
-        val_count = 0
+        val_iou = []
 
         with torch.no_grad():
-            for imgs, masks, _ in val_loader:
+            for imgs, masks, *_ in val_loader:
                 imgs, masks = imgs.to(device), masks.to(device)
 
-                logits = model(imgs)                      # [1,2,512,512]
-                probs  = torch.sigmoid(logits)[0, 1]      # squeeze batch, pick channel=1
-                true   = masks[0, 1]                      # ground‐truth transformer mask
+                logits = model(imgs)
+                if args.tta_flip:
+                    # Simple horizontal flip TTA
+                    logits_orig = model(imgs)
+                    logits_flip = torch.flip(model(torch.flip(imgs, dims=[3])), dims=[3])
+                    logits = (logits_orig + logits_flip) / 2
+                elif args.multi_scale:
+                    logits = multi_scale_tta(model, imgs, device)
+                else:
+                    logits = model(imgs)
 
-                pred_bin = (probs > 0.5).float()
-                inter    = (pred_bin * true).sum().item()
-                union    = ((pred_bin + true) > 0).sum().item()
-                iou      = inter / union if union > 0 else 1.0
+                probs = torch.sigmoid(logits)
+                if args.adaptive_thresh:
+                    # Find optimal threshold for this batch
+                    threshold_opt = find_optimal_threshold(probs, masks)
+                    preds = (probs > threshold_opt).float()
+                else:
+                    # Use fixed threshold
+                    preds = (probs > 0.5).float()
 
-                val_iou += iou
-                val_count += 1
+                # Apply post-processing to predictions
+                if args.post_process:
+                    pred_np = preds.squeeze().cpu().numpy()  # Remove all singleton dimensions
+                    if pred_np.ndim == 2:  # Ensure 2D for post-processing
+                        pred_np = post_process_predictions(pred_np, args.min_size, args.merge_distance)
+                        preds = torch.from_numpy(pred_np).to(device).float()
+                        # Reshape back to [1, 1, H, W]
+                        while preds.ndim < 4:
+                            preds = preds.unsqueeze(0)
 
-        avg_val_iou = val_iou / val_count
-        scheduler.step(avg_val_iou)  # adjust learning rate based on validation IoU
-        print(f"Epoch {epoch}/{args.epochs} → Val IoU: {avg_val_iou:.4f}")
-        print(f"  → Learning rate: {scheduler.get_last_lr()}")
+                inter = (preds * masks).sum()
+                union = preds.sum() + masks.sum() - inter
+                val_iou.append(((inter + 1e-6) / (union + 1e-6)).item())
 
-        # 7) Checkpoint if validation IoU improved
-        ckpt_name = f"model_epoch{epoch}_valIoU{avg_val_iou:.4f}.pth"
-        ckpt_path = os.path.join(args.log_dir, ckpt_name)
-        os.makedirs(args.log_dir, exist_ok=True)
+        avg_val_iou = np.mean(val_iou)
 
+        # LR step for Plateau schedule
+        if not args.one_cycle:
+            scheduler.step(avg_val_iou)
+
+        lr_now = optimizer.param_groups[0]["lr"]
+        print(f"           Val IoU: {avg_val_iou:.4f}  |  LR: {lr_now:.6f}")
+
+        # ---- Checkpoint / early-stop ---------------------------------
         if avg_val_iou > best_val_iou:
             best_val_iou = avg_val_iou
-            torch.save({
-                'epoch': epoch,
-                'model_state_dict': model.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
-                'scheduler_state_dict': scheduler.state_dict(),
-                'best_val_iou': best_val_iou
-            }, ckpt_path)
+            stagnant_epochs = 0
+            ckpt_name = f"model_best_epoch{epoch}_valIoU{avg_val_iou:.4f}.pth"
+            torch.save(model.state_dict(), os.path.join(args.log_dir, ckpt_name))
             print(f"  → New best model saved: {ckpt_name}")
+        else:
+            stagnant_epochs += 1
+            print(f"  → No improvement for {stagnant_epochs} epoch(s)")
+
+        if args.early_stop and stagnant_epochs >= args.early_stop:
+            print(f"Early stopping (patience = {args.early_stop})")
+            break
 
     print(f"\nTraining complete. Best Val IoU: {best_val_iou:.4f}")
+
 
 
 # ---------------------------
 # Argument Parsing
 # ---------------------------
 def parse_args():
-    p = argparse.ArgumentParser()
+    p = argparse.ArgumentParser(description="Train U-Net for transformer segmentation.")
 
-    # Train split
-    p.add_argument('--train_images_dir', type=str, required=True,
-                   help='Path to folder of training images (e.g. Dataset/train)')
-    p.add_argument('--train_coco_json',  type=str, required=True,
-                   help='Path to COCO JSON for training (e.g. Dataset/train/_annotations.coco.json)')
-
-    # Validation split
-    p.add_argument('--val_images_dir', type=str, required=True,
-                   help='Path to folder of validation images (e.g. Dataset/valid)')
-    p.add_argument('--val_coco_json',  type=str, required=True,
-                   help='Path to COCO JSON for validation (e.g. Dataset/valid/_annotations.coco.json)')
+    # Data paths
+    p.add_argument('--train_images_dir', type=str, required=True, help='Path to folder of training images.')
+    p.add_argument('--train_coco_json',  type=str, required=True, help='Path to COCO JSON for training.')
+    p.add_argument('--val_images_dir', type=str, required=True, help='Path to folder of validation images.')
+    p.add_argument('--val_coco_json',  type=str, required=True, help='Path to COCO JSON for validation.')
 
     # Training hyperparameters
     p.add_argument('--batch_size',  type=int, default=8)
@@ -408,12 +562,26 @@ def parse_args():
     p.add_argument('--epochs',      type=int, default=50)
     p.add_argument('--num_workers', type=int, default=4)
 
-    # Device & logging
-    p.add_argument('--device',      type=str, default='auto', choices=['auto', 'cpu', 'cuda'])
-    p.add_argument('--dry_run',     action='store_true',
-                   help='Perform a single batch test and exit')
-    p.add_argument('--log_dir',     type=str, default='runs',
-                   help='Directory in which to save best‐IoU checkpoints')
+    # System and logging
+    p.add_argument('--device',      type=str, default='cuda', choices=['cpu', 'cuda'])
+    p.add_argument('--dry_run',     action='store_true', help='Perform a single batch test and exit.')
+    p.add_argument('--log_dir',     type=str, default='runs', help='Directory to save best checkpoints.')
+    p.add_argument('--encoder', type=str, default='resnet34', help='SMP backbone, e.g. resnet34, efficientnet-b3…')
+    p.add_argument('--one_cycle', action='store_true', help='Use One-Cycle LR schedule')
+    p.add_argument('--early_stop', type=int, default=0, help='Patience in epochs (0 = off, i.e. disabled)')
+    p.add_argument('--tta_flip', action='store_true', help='Average logits of image and its horizontal flip during validation')
+    p.add_argument('--loss_ft', action='store_true', help='Use Focal-Tversky loss (alpha 0.7, gamma 0.75) instead of BCE+Dice')
+
+    # --- New flags for advanced features ---
+    p.add_argument('--use_focal', action='store_true', help='Use Focal Loss')
+    p.add_argument('--hard_mining', action='store_true', help='Enable hard negative mining')
+    p.add_argument('--use_boundary', action='store_true', help='Add boundary loss')
+    p.add_argument('--adaptive_thresh', action='store_true', help='Enable adaptive thresholding during validation')
+    p.add_argument('--post_process', action='store_true', help='Apply post-processing to predictions')
+    p.add_argument('--min_size', type=int, default=100, help='Min size for post-processing components')
+    p.add_argument('--merge_distance', type=int, default=20, help='Merge distance for post-processing')
+    p.add_argument('--decoder_attention', type=str, default=None, help='Decoder attention type (e.g. scse)')
+    p.add_argument('--multi_scale', action='store_true', help='Enable multi-scale TTA during validation')
 
     return p.parse_args()
 

@@ -159,6 +159,9 @@ notebooks/.ipynb_checkpoints/
 
 # Dataset artifacts
 Dataset/
+Dataset_v2/
+Dataset_v2_filtered/
+Dataset_v3/
 
 # Logs
 logs/
@@ -168,6 +171,10 @@ runs/
 runs_obb/
 *.pt
 *.pth
+final_results/
+final_results_obb/
+analysis/
+ensemble_inference_results/
 
 # Weights & Biases
 wandb/
