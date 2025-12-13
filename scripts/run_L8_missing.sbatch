@@ -11,7 +11,7 @@
 #SBATCH --gres=gpu:1
 #SBATCH --time=12:00:00
 
-#SBATCH --array=1-2
+#SBATCH --array=0
 #SBATCH --mail-type=END,FAIL
 #SBATCH --mail-user=seif.daknou@campus.tu-berlin.de
 
@@ -22,7 +22,7 @@ cd ~/Master-Thesis
 export WANDB_API_KEY=$(< ~/.wandb_api_key)
 
 CONFIGS=(
-  "--metric_threshold 0.30 --use_sampler_weights --img_size 1200 \
+  "--resume runs/orthL8/binary_exp_1754111648/best_model_epoch179.pth --metric_threshold 0.30 --use_sampler_weights --img_size 1200 \
    --wandb_tags orthL8,res1200,th0.3,samp_w,pw_off"
 
   "--metric_threshold 0.30 --img_size 1024 \
@@ -37,7 +37,7 @@ ARGS=${CONFIGS[$SLURM_ARRAY_TASK_ID]}
 python main.py \
   --batch_size 4 \
   --lr 1e-4 \
-  --epochs 100 \
+  --epochs 200 \
   --num_workers 4 \
   --device cuda \
   --log_dir ~/Master-Thesis/runs/orthL8 \

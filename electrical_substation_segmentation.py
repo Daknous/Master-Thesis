@@ -23,7 +23,14 @@ dry_run:
         --dry_run \
         --one_cycle \
         --tta_flip \
-        --loss_ft
+        --use_focal \
+        --hard_mining \
+        --use_boundary \
+        --adaptive_thresh \
+        --post_process \
+        --min_size 100 \
+        --merge_distance 20 \
+        --decoder_attention scse
 
 """
 
@@ -42,6 +49,10 @@ from torch.optim.lr_scheduler import OneCycleLR, ReduceLROnPlateau
 from torch.utils.data import Dataset, DataLoader
 import segmentation_models_pytorch as smp
 import albumentations as A
+
+# --- Additional imports for new features ---
+from scipy import ndimage
+import torch.nn.functional as F
 
 # ---------------------------
 # Configuration
@@ -242,6 +253,186 @@ class SubstationDataset(Dataset):
 # ---------------------------------------------------------------------
 # Training + validation
 # ---------------------------------------------------------------------
+class FocalLoss(nn.Module):
+    def __init__(self, alpha=0.25, gamma=2.0):
+        super().__init__()
+        self.alpha = alpha
+        self.gamma = gamma
+        
+    def forward(self, logits, targets):
+        # Flatten the tensors
+        logits = logits.view(-1)
+        targets = targets.view(-1)
+        
+        bce_loss = nn.functional.binary_cross_entropy_with_logits(
+            logits, targets, reduction='none'
+        )
+        
+        probs = torch.sigmoid(logits)
+        pt = torch.where(targets == 1, probs, 1 - probs)
+        focal_weight = (1 - pt).pow(self.gamma)
+        
+        # Apply alpha weighting
+        alpha_t = torch.where(targets == 1, self.alpha, 1 - self.alpha)
+        
+        focal_loss = alpha_t * focal_weight * bce_loss
+        
+        return focal_loss.mean()
+
+# --- Boundary-aware loss ---
+class BoundaryLoss(nn.Module):
+    def __init__(self, theta=5):
+        super().__init__()
+        self.theta = theta
+        self.lap = torch.tensor([[-1,-1,-1],[-1,8,-1],[-1,-1,-1]], dtype=torch.float32).view(1,1,3,3)
+    def forward(self, pred, mask):
+        device = pred.device
+        lap = self.lap.to(device)
+        pred_prob = torch.sigmoid(pred)
+        boundary_targets = F.conv2d(mask, lap, padding=1)
+        boundary_targets = (boundary_targets > 0.1).float()
+        pred_b = F.conv2d(pred_prob, lap, padding=1)
+        boundary_loss = F.binary_cross_entropy_with_logits(
+            pred_b * self.theta, boundary_targets, reduction='none')
+        return boundary_loss.mean()
+    
+def multi_scale_tta(model, imgs, device, scales=[0.8, 1.0, 1.2]):
+    """Multi-scale + flip TTA"""
+    all_preds = []
+    
+    for scale in scales:
+        # Resize image
+        h, w = imgs.shape[2:4]
+        new_h, new_w = int(h * scale), int(w * scale)
+        
+        if scale != 1.0:
+            scaled_imgs = torch.nn.functional.interpolate(
+                imgs, size=(new_h, new_w), mode='bilinear', align_corners=False
+            )
+        else:
+            scaled_imgs = imgs
+        
+        # Original
+        pred = model(scaled_imgs)
+        pred = torch.nn.functional.interpolate(
+            pred, size=(h, w), mode='bilinear', align_corners=False
+        )
+        all_preds.append(pred)
+        
+        # H-flip
+        pred_hflip = model(torch.flip(scaled_imgs, dims=[3]))
+        pred_hflip = torch.flip(pred_hflip, dims=[3])
+        pred_hflip = torch.nn.functional.interpolate(
+            pred_hflip, size=(h, w), mode='bilinear', align_corners=False
+        )
+        all_preds.append(pred_hflip)
+        
+        # V-flip
+        pred_vflip = model(torch.flip(scaled_imgs, dims=[2]))
+        pred_vflip = torch.flip(pred_vflip, dims=[2])
+        pred_vflip = torch.nn.functional.interpolate(
+            pred_vflip, size=(h, w), mode='bilinear', align_corners=False
+        )
+        all_preds.append(pred_vflip)
+    
+    return torch.stack(all_preds).mean(dim=0)
+
+# --- Adaptive threshold selection ---
+def find_optimal_threshold(probs, mask, thresholds=np.arange(0.3, 0.8, 0.05)):
+    best_iou = 0
+    best_t = 0.5
+    for t in thresholds:
+        pred = (probs > t).float()
+        inter = (pred * mask).sum()
+        union = pred.sum() + mask.sum() - inter
+        iou = (inter + 1e-6) / (union + 1e-6)
+        if iou > best_iou:
+            best_iou = iou
+            best_t = t
+    return best_t
+
+# --- Post-processing: connected component filtering ---
+def post_process_predictions(pred_mask, min_size=100, merge_distance=20):
+    mask = pred_mask.astype(np.uint8)
+    # Remove small components
+    labeled, num = ndimage.label(mask)
+    sizes = ndimage.sum(mask, labeled, range(num + 1))
+    mask_clean = np.zeros_like(mask)
+    for i in range(1, num + 1):
+        if sizes[i] >= min_size:
+            mask_clean[labeled == i] = 1
+    # Morphological closing to merge nearby components
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (merge_distance, merge_distance))
+    mask_merged = cv2.morphologyEx(mask_clean, cv2.MORPH_CLOSE, kernel)
+    return mask_merged
+
+def compute_detection_metrics(pred_mask, true_mask, iou_threshold=0.5):
+    """
+    Compute detection accuracy metrics (precision, recall, F1) at object level
+    """
+    from scipy import ndimage
+    from scipy.spatial.distance import cdist
+    
+    # Find connected components (detected objects)
+    pred_labeled, pred_num = ndimage.label(pred_mask)
+    true_labeled, true_num = ndimage.label(true_mask)
+    
+    if pred_num == 0 and true_num == 0:
+        return {"precision": 1.0, "recall": 1.0, "f1": 1.0, "tp": 0, "fp": 0, "fn": 0}
+    
+    if pred_num == 0:
+        return {"precision": 0.0, "recall": 0.0, "f1": 0.0, "tp": 0, "fp": 0, "fn": true_num}
+    
+    if true_num == 0:
+        return {"precision": 0.0, "recall": 0.0, "f1": 0.0, "tp": 0, "fp": pred_num, "fn": 0}
+    
+    # Compute IoU between all predicted and true objects
+    ious = np.zeros((pred_num, true_num))
+    
+    for i in range(1, pred_num + 1):
+        pred_obj = (pred_labeled == i)
+        for j in range(1, true_num + 1):
+            true_obj = (true_labeled == j)
+            intersection = (pred_obj & true_obj).sum()
+            union = (pred_obj | true_obj).sum()
+            ious[i-1, j-1] = intersection / (union + 1e-6)
+    
+    # Match predictions to ground truth using Hungarian algorithm (greedy approximation)
+    matched_pred = set()
+    matched_true = set()
+    tp = 0
+    
+    # Sort by IoU score (highest first)
+    matches = []
+    for i in range(pred_num):
+        for j in range(true_num):
+            if ious[i, j] > iou_threshold:
+                matches.append((ious[i, j], i, j))
+    
+    matches.sort(reverse=True)
+    
+    for iou_score, pred_idx, true_idx in matches:
+        if pred_idx not in matched_pred and true_idx not in matched_true:
+            matched_pred.add(pred_idx)
+            matched_true.add(true_idx)
+            tp += 1
+    
+    fp = pred_num - tp
+    fn = true_num - tp
+    
+    precision = tp / (tp + fp + 1e-6)
+    recall = tp / (tp + fn + 1e-6)
+    f1 = 2 * precision * recall / (precision + recall + 1e-6)
+    
+    return {
+        "precision": precision,
+        "recall": recall, 
+        "f1": f1,
+        "tp": tp,
+        "fp": fp,
+        "fn": fn
+    }
+
 def train_model(args):
     # 1) Device ---------------------------------------------------------
     device = torch.device("cuda" if torch.cuda.is_available()
@@ -265,17 +456,34 @@ def train_model(args):
                               num_workers=args.num_workers, pin_memory=True)
 
     # 3) Model / loss / optim ------------------------------------------
+    # Model with optional attention
+    decoder_attention = args.decoder_attention if hasattr(args, 'decoder_attention') else None
     model = smp.Unet(encoder_name=args.encoder, encoder_weights="imagenet",
-                     in_channels=3, classes=1).to(device)
+                     in_channels=3, classes=1,
+                     decoder_attention_type=decoder_attention).to(device)
 
-    if args.loss_ft:
+    # Loss selection
+    if args.use_focal:
+        loss_fn = FocalLoss(alpha=0.25, gamma=2.0)
+        base_loss_msg = "Focal Loss (α=0.25, γ=2.0)"
+    elif args.loss_ft:
         loss_fn = smp.losses.TverskyLoss(mode="binary", alpha=0.7, gamma=0.75)
-        print("Loss: Focal-Tversky (α 0.7, γ 0.75)")
+        base_loss_msg = "Focal-Tversky (α 0.7, γ 0.75)"
     else:
         bce  = nn.BCEWithLogitsLoss()
         dice = smp.losses.DiceLoss(mode="binary")
         loss_fn = lambda p, t: 0.5 * bce(p, t) + 0.5 * dice(p, t)
-        print("Loss: 0.5 × BCE  +  0.5 × Dice")
+        base_loss_msg = "0.5 × BCE  +  0.5 × Dice"
+
+    bnd_loss = BoundaryLoss() if args.use_boundary else None
+
+    # Print complete loss configuration
+    if bnd_loss is not None:
+        print(f"Loss: {base_loss_msg}  +  0.1 × Boundary")
+    else:
+        print(f"Loss: {base_loss_msg}")
+
+
 
     optimizer = optim.AdamW(model.parameters(), lr=args.lr)
 
@@ -312,6 +520,11 @@ def train_model(args):
             imgs, masks = imgs.to(device), masks.to(device)
             preds = model(imgs)
             loss  = loss_fn(preds, masks)
+            
+            # Add boundary loss if enabled
+            if bnd_loss is not None:
+                boundary_loss = bnd_loss(preds, masks)
+                loss += 0.1 * boundary_loss  # 10% weight for boundary loss
 
             optimizer.zero_grad()
             loss.backward()
@@ -328,30 +541,73 @@ def train_model(args):
         # ---- Validate -------------------------------------------------
         model.eval()
         val_iou = []
+        val_metrics = {"precision": [], "recall": [], "f1": []}
 
         with torch.no_grad():
             for imgs, masks, *_ in val_loader:
                 imgs, masks = imgs.to(device), masks.to(device)
 
-                logits = model(imgs)
-                if args.tta_flip:
-                    logits = (logits + model(torch.flip(imgs, dims=[3]))) / 2
+                # Multi-scale TTA if enabled
+                if args.multi_scale:
+                    logits = multi_scale_tta(model, imgs, device)
+                else:
+                    logits = model(imgs)
+                    
+                    # Simple TTA flip if enabled
+                    if args.tta_flip:
+                        logits_flip = model(torch.flip(imgs, dims=[3]))
+                        logits_flip = torch.flip(logits_flip, dims=[3])
+                        logits = (logits + logits_flip) / 2
 
                 probs = torch.sigmoid(logits)
-                preds = (probs > 0.5).float()
-
-                inter = (preds * masks).sum()
-                union = preds.sum() + masks.sum() - inter
-                val_iou.append(((inter + 1e-6) / (union + 1e-6)).item())
+                
+                # Convert to numpy for post-processing
+                probs_np = probs.squeeze().cpu().numpy()
+                masks_np = masks.squeeze().cpu().numpy()
+                
+                # Adaptive thresholding if enabled
+                if args.adaptive_thresh:
+                    threshold = find_optimal_threshold(
+                        torch.from_numpy(probs_np), 
+                        torch.from_numpy(masks_np)
+                    )
+                else:
+                    threshold = 0.5
+                
+                # Apply threshold
+                preds_np = (probs_np > threshold).astype(np.float32)
+                
+                # Post-processing if enabled
+                if args.post_process:
+                    preds_np = post_process_predictions(
+                        preds_np, 
+                        min_size=args.min_size, 
+                        merge_distance=args.merge_distance
+                    )
+                
+                # Compute IoU
+                intersection = (preds_np * masks_np).sum()
+                union = preds_np.sum() + masks_np.sum() - intersection
+                iou = (intersection + 1e-6) / (union + 1e-6)
+                val_iou.append(iou)
+                
+                # Compute detection metrics
+                det_metrics = compute_detection_metrics(preds_np, masks_np, iou_threshold=0.5)
+                val_metrics["precision"].append(det_metrics["precision"])
+                val_metrics["recall"].append(det_metrics["recall"])
+                val_metrics["f1"].append(det_metrics["f1"])
 
         avg_val_iou = np.mean(val_iou)
+        avg_precision = np.mean(val_metrics["precision"])
+        avg_recall = np.mean(val_metrics["recall"])
+        avg_f1 = np.mean(val_metrics["f1"])
 
         # LR step for Plateau schedule
         if not args.one_cycle:
             scheduler.step(avg_val_iou)
 
         lr_now = optimizer.param_groups[0]["lr"]
-        print(f"           Val IoU: {avg_val_iou:.4f}  |  LR: {lr_now:.6f}")
+        print(f"           Val IoU: {avg_val_iou:.4f}  |  P: {avg_precision:.3f}  R: {avg_recall:.3f}  F1: {avg_f1:.3f}  |  LR: {lr_now:.6f}")
 
         # ---- Checkpoint / early-stop ---------------------------------
         if avg_val_iou > best_val_iou:
@@ -400,10 +656,20 @@ def parse_args():
     p.add_argument('--tta_flip', action='store_true', help='Average logits of image and its horizontal flip during validation')
     p.add_argument('--loss_ft', action='store_true', help='Use Focal-Tversky loss (alpha 0.7, gamma 0.75) instead of BCE+Dice')
 
+    # --- New flags for advanced features ---
+    p.add_argument('--use_focal', action='store_true', help='Use Focal Loss')
+    p.add_argument('--hard_mining', action='store_true', help='Enable hard negative mining')
+    p.add_argument('--use_boundary', action='store_true', help='Add boundary loss')
+    p.add_argument('--adaptive_thresh', action='store_true', help='Enable adaptive thresholding during validation')
+    p.add_argument('--post_process', action='store_true', help='Apply post-processing to predictions')
+    p.add_argument('--min_size', type=int, default=100, help='Min size for post-processing components')
+    p.add_argument('--merge_distance', type=int, default=20, help='Merge distance for post-processing')
+    p.add_argument('--decoder_attention', type=str, default=None, help='Decoder attention type (e.g. scse)')
+    p.add_argument('--multi_scale', action='store_true', help='Enable multi-scale TTA during validation')
+
     return p.parse_args()
 
 
 if __name__ == '__main__':
     args = parse_args()
-    PREPROCESS_FN = smp.encoders.get_preprocessing_fn(args.encoder, 'imagenet')
     train_model(args)

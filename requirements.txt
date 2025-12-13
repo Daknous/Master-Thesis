@@ -23,3 +23,11 @@ tqdm>=4.64.0
 tensorboard>=2.9.0
 
 wandb==0.21.0
+
+scipy==1.10.1
+
+ultralytics>=8.3.0
+
+pandas
+
+rich

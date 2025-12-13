@@ -1,6 +1,5 @@
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 import segmentation_models_pytorch as smp
 
 # UNet for binary segmentation with single channel output
@@ -11,6 +10,7 @@ class UnetWithDecoderDropout(smp.Unet):
         encoder_weights: str,
         in_channels: int,
         classes: int,
+        decoder_attention_type: str = "none",
         dropout: float = 0.0,
         **kwargs
     ):
@@ -19,6 +19,7 @@ class UnetWithDecoderDropout(smp.Unet):
             encoder_weights=encoder_weights,
             in_channels=in_channels,
             classes=classes,
+            decoder_attention_type=None if decoder_attention_type=="none" else decoder_attention_type,
             **kwargs
         )
         # Dropout applied to the final mask logits
@@ -33,7 +34,7 @@ class UnetWithDecoderDropout(smp.Unet):
 # Factory functions for main.py
 from helper.preprocessing import ENCODER
 
-def get_model(device: torch.device, dropout: float = 0.0) -> nn.Module:
+def get_model(device: torch.device, dropout: float = 0.0, decoder_attention: str = "none") -> nn.Module:
     """
     Create binary segmentation model with single channel output.
     """
@@ -42,7 +43,8 @@ def get_model(device: torch.device, dropout: float = 0.0) -> nn.Module:
         encoder_weights='imagenet',
         in_channels=3,
         classes=1,  # Single channel for binary segmentation
-        dropout=dropout
+        dropout=dropout,
+        decoder_attention_type=decoder_attention
     )
     return model.to(device)
 
@@ -92,16 +94,49 @@ class BinarySegmentationLoss(nn.Module):
 
         return self.bce_weight * bce_loss + self.dice_weight * dice_loss
 
+class FocalTverskyLoss(nn.Module):
+    """
+    Focal-Tversky for one-channel logits/targets.
+    Default alpha=0.7, beta=0.3 as in the paper; gamma=0.75 to add focal behaviour.
+    """
+    def __init__(self, alpha=0.7, beta=0.3, gamma=0.75, smooth=1e-6):
+        super().__init__()
+        self.alpha, self.beta, self.gamma, self.smooth = alpha, beta, gamma, smooth
 
-def get_criterion(pos_weight: float = None) -> nn.Module:
+    def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        logits  = logits.squeeze(1)                 # [B,H,W]
+        probs   = torch.sigmoid(logits)
+
+        # flatten to (B, -1) for simplicity
+        probs   = probs.view(probs.size(0), -1)
+        targets = targets.view(targets.size(0), -1)
+
+        tp = (probs * targets).sum(dim=1)
+        fp = (probs * (1 - targets)).sum(dim=1)
+        fn = ((1 - probs) * targets).sum(dim=1)
+
+        tversky = (tp + self.smooth) / (
+            tp + self.alpha * fp + self.beta * fn + self.smooth)
+
+        focal_tversky = (1 - tversky) ** self.gamma
+        return focal_tversky.mean()
+
+
+
+def get_criterion(loss_name: str = "bce_dice", pos_weight: float = None) -> nn.Module:
     """
-    Returns a BinarySegmentationLoss with optional pos_weight.
+    Returns a BinarySegmentationLoss with optional pos_weight or FocalTverskyLoss.
     """
-    return BinarySegmentationLoss(
-        bce_weight=1.0,
-        dice_weight=1.0,
-        pos_weight=pos_weight
-    )
+    if loss_name == "bce_dice":
+        return BinarySegmentationLoss(
+            bce_weight=1.0,
+            dice_weight=1.0,
+            pos_weight=pos_weight
+        )
+    elif loss_name == "focal_tversky":
+        return FocalTverskyLoss()
+    else:
+        raise ValueError(f"Unknown loss: {loss_name}")
 
 
 def get_optimizer(model: torch.nn.Module, lr: float) -> torch.optim.Optimizer:

@@ -98,27 +98,27 @@ def get_training_augmentation(img_size: int):
     return A.Compose([
         A.Rotate(limit=30, p=0.5),
         A.HorizontalFlip(p=0.5),
-        A.RandomResizedCrop(                       # <- FIXED
-            size=(img_size, img_size),             # keyword args
-            scale=(0.9, 1.0),                      # upper bound 1.0
-            ratio=(1.0, 1.0),                      # keep square patches
-            p=0.30
-        ),
-        A.PadIfNeeded(min_height=img_size, min_width=img_size, border_mode=cv2.BORDER_REFLECT),
-        A.Resize(img_size, img_size, interpolation=cv2.INTER_LINEAR),
+        # A.RandomResizedCrop(                       # <- FIXED
+        #     size=(img_size, img_size),             # keyword args
+        #     scale=(0.9, 1.0),                      # upper bound 1.0
+        #     ratio=(1.0, 1.0),                      # keep square patches
+        #     p=0.30
+        # ),
+        # A.PadIfNeeded(min_height=img_size, min_width=img_size, border_mode=cv2.BORDER_REFLECT),
+        # A.Resize(img_size, img_size, interpolation=cv2.INTER_LINEAR),
 
         # RandomCropWithMask(height=img_size, width=img_size, min_mask_frac=0.005, max_tries=5, p=1.0),
         A.RandomBrightnessContrast(brightness_limit=0.1, contrast_limit=0.1, p=0.3),
         # A.GaussianBlur(blur_limit=7, p=0.2),
-        A.GaussNoise(p=0.2),
-        MaskAwareDropout(max_holes=8, hole_frac=0.05, max_mask_overlap_frac=0.1, max_tries=10, p=0.3),
+        # A.GaussNoise(p=0.2),
+        # MaskAwareDropout(max_holes=8, hole_frac=0.05, max_mask_overlap_frac=0.1, max_tries=10, p=0.3),
     ], additional_targets={'mask': 'mask'})
 
 
 def get_validation_augmentation(img_size: int):
     return A.Compose([
-        A.PadIfNeeded(min_height=img_size, min_width=img_size, border_mode=cv2.BORDER_REFLECT, p=1),
-        A.Resize(img_size, img_size, interpolation=cv2.INTER_LINEAR),
+        # A.PadIfNeeded(min_height=img_size, min_width=img_size, border_mode=cv2.BORDER_REFLECT, p=1),
+        # A.Resize(img_size, img_size, interpolation=cv2.INTER_LINEAR),
 
         # A.CenterCrop(height=img_size, width=img_size, p=1),
     ], additional_targets={'mask': 'mask'})

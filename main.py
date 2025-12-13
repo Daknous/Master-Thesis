@@ -51,6 +51,16 @@ def parse_args():
     parser.add_argument('--use_sampler_weights', action='store_true',
                         help='Enable WeightedRandomSampler to up-weight rare positives')
 
+# ─── NEW EXPERIMENT FLAGS ───────────────────────────────────────────
+    parser.add_argument('--decoder_attention', type=str, default='none',
+                        choices=['none','scse'],
+                        help='Attention block injected in UNet decoder')
+    parser.add_argument('--loss', type=str, default='bce_dice',
+                        choices=['bce_dice','focal_tversky'],
+                        help='Loss function')
+    parser.add_argument('--tta_vflip', action='store_true',
+                        help='Use vertical-flip TTA during evaluation')
+
     return parser.parse_args()
 
 def main():
@@ -100,16 +110,28 @@ def main():
     )
 
     # Model
-    model = get_model(device, dropout=args.dropout)
+    model = get_model(device, dropout=args.dropout, decoder_attention=args.decoder_attention)
 
-    # Criterion: with or without pos_weight
+    # ---------- loss / pos-weight ------------------------------------------------
     if args.apply_pos_weight:
-        mean_cov   = 0.001989
-        pos_weight = (1.0 - mean_cov) / mean_cov
-        criterion  = get_criterion(pos_weight=pos_weight)
+        mean_cov   = compute_mean_coverage(train_loader)          # e.g. 2 × 10⁻⁴
+        pos_weight = (1.0 - mean_cov) / mean_cov                 # inverse prevalence
+
+        # ---- cap the value ------------------------------------------------------
+        MIN_W, MAX_W = 1.0, 5_000.0                               # tweak as desired
+        pos_weight   = float(np.clip(pos_weight, MIN_W, MAX_W))
+
+        print(f"mean_cov = {mean_cov:.6f}  →  pos_weight = {pos_weight:.1f}")
+        wandb.config.update({'mean_cov': mean_cov,
+                            'pos_weight': pos_weight})           # track in W&B
+
+        criterion = get_criterion(loss_name=args.loss,
+                                pos_weight=pos_weight)
     else:
-        criterion = get_criterion()
+        criterion = get_criterion(loss_name=args.loss)
+    
     criterion = criterion.to(device)
+
 
     # Optimizer & Scheduler
     optimizer = get_optimizer(model, lr=args.lr)
@@ -171,8 +193,8 @@ def main():
 
         # End-of-epoch evaluation
         model.eval()
-        train_metrics = evaluate_model(model, train_loader, device, metric_threshold, criterion)
-        val_metrics   = evaluate_model(model, val_loader,   device, metric_threshold, criterion)
+        train_metrics = evaluate_model(model, train_loader, device, metric_threshold, criterion, tta_vflip = args.tta_vflip)
+        val_metrics   = evaluate_model(model, val_loader,   device, metric_threshold, criterion, tta_vflip = args.tta_vflip)
         current_lr    = scheduler.get_last_lr()[0]
 
         print(
@@ -219,7 +241,15 @@ def main():
     print(f"Training complete. Best Val IoU: {best_val_iou:.4f}")
 
 
-def evaluate_model(model, dataloader, device, threshold, criterion):
+def compute_mean_coverage(loader):
+    total_pix = 0
+    total_fg  = 0
+    for _, masks in loader:
+        total_pix += masks.numel()
+        total_fg  += (masks > 0).sum().item()
+    return total_fg / total_pix
+
+def evaluate_model(model, dataloader, device, threshold, criterion, tta_vflip):
     """Evaluate model on given dataloader."""
     model.eval()
     total_loss = total_iou = total_dice = total_pixel_acc = 0.0
@@ -227,6 +257,11 @@ def evaluate_model(model, dataloader, device, threshold, criterion):
         for imgs, masks in dataloader:
             imgs, masks = imgs.to(device), masks.to(device)
             logits = model(imgs)                      # [B, 1, H, W]
+
+            # ─── optional vertical-flip TTA ─────────────────────────────
+            if tta_vflip:
+                logits_v = torch.flip(model(torch.flip(imgs, dims=[2])), dims=[2])
+                logits   = 0.5 * (logits + logits_v)
 
             # Loss with the *passed-in* criterion
             loss = criterion(logits, masks)

@@ -1,14 +1,14 @@
 #!/bin/bash
-#SBATCH --job-name=subseg_train2
-#SBATCH --output=/home/users/s/seifdak/Master-Thesis/logs/train_%j.out
-#SBATCH --error=/home/users/s/seifdak/Master-Thesis/logs/train_%j.err
+#SBATCH --job-name=subseg_v3_r34_oc
+#SBATCH --output=/home/users/s/seifdak/Master-Thesis/logs/%x_%j.out
+#SBATCH --error=/home/users/s/seifdak/Master-Thesis/logs/%x_%j.err
 #SBATCH --partition=gpu
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=32G
 #SBATCH --gres=gpu:1
-#SBATCH --time=10:00:00
+#SBATCH --time=20:00:00
 
 #SBATCH --mail-type=END,FAIL
 #SBATCH --mail-user=seif.daknou@campus.tu-berlin.de
@@ -24,11 +24,15 @@ srun python ~/Master-Thesis/electrical_substation_segmentation.py \
      --train_coco_json   ~/Master-Thesis/Dataset_v2_filtered/train/_annotations.coco.json \
      --val_images_dir    ~/Master-Thesis/Dataset_v2_filtered/valid \
      --val_coco_json     ~/Master-Thesis/Dataset_v2_filtered/valid/_annotations.coco.json \
-     --batch_size 2 \
+     --batch_size 4 \
      --lr 1e-4 \
-     --epochs 100 \
-     --num_workers 4 \
-     --device cuda \
-     --log_dir ~/Master-Thesis/runs/exp5_dataset_v2 \
-     --encoder resnet34 \
-     --one_cycle
+     --epochs 200 \
+     --one_cycle \
+     --use_focal \
+     --use_boundary \
+     --tta_flip \
+     --adaptive_thresh \
+     --post_process \
+     --min_size 50 \
+     --merge_distance 15 \
+     --log_dir runs/final_exp/focal_boundary_exp
