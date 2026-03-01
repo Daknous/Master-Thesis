@@ -24,6 +24,8 @@ srun python ~/Master-Thesis/electrical_substation_segmentation.py \
      --train_coco_json   ~/Master-Thesis/Dataset_v2_filtered/train/_annotations.coco.json \
      --val_images_dir    ~/Master-Thesis/Dataset_v2_filtered/valid \
      --val_coco_json     ~/Master-Thesis/Dataset_v2_filtered/valid/_annotations.coco.json \
+     --test_images_dir   ~/Master-Thesis/Dataset_v2_filtered/test \
+     --test_coco_json    ~/Master-Thesis/Dataset_v2_filtered/test/_annotations.coco.json \
      --batch_size 4 \
      --lr 1e-4 \
      --epochs 200 \
